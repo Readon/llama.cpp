@@ -6255,7 +6255,7 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     }
 
     ctx->encode_async = Block_copy(^(size_t iter) {
-        const int cb_idx = iter;
+        const int cb_idx = (int)iter;
         const int n_cb_l = ctx->n_cb;
 
         const int n_nodes_0 = ctx->n_nodes_0;
@@ -6681,7 +6681,7 @@ ggml_backend_buffer_type_t ggml_backend_metal_split_buffer_type(const float * te
     // Return nullptr to indicate fallback to regular buffer type
     // This could be implemented in the future using multiple Metal devices
     GGML_UNUSED(tensor_split);
-    return nullptr;
+    return NULL;
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

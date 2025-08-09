@@ -2109,7 +2109,7 @@ static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer
     if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
         // This is a matrix, split along columns across NUMA nodes
         printf("Initializing tensor %s [%lld,%lld] for column TP across %zu NUMA nodes\n",
-               tensor->name && tensor->name[0] ? tensor->name : "unnamed", (long long)tensor->ne[0], (long long)tensor->ne[1], ctx->split_buffers.size());
+               tensor->name[0] ? tensor->name : "unnamed", (long long)tensor->ne[0], (long long)tensor->ne[1], ctx->split_buffers.size());
 
         // For column TP, we need to set up the tensor to point to the distributed data
         // The actual data distribution will be handled in set_tensor/get_tensor
@@ -2127,7 +2127,7 @@ static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer
         // Vector, scalar, or single NUMA node - use first buffer
         tensor->data = ctx->split_buffers[0];
         printf("Initializing tensor %s on single NUMA node %d\n",
-               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
+               tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
     }
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
@@ -2143,7 +2143,7 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
         size_t cols_per_split = tensor->ne[1] / ctx->split_buffers.size();
 
         printf("Distributing tensor %s data across %zu NUMA nodes (col_size=%zu, cols_per_split=%zu)\n",
-               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->split_buffers.size(), col_size, cols_per_split);
+               tensor->name[0] ? tensor->name : "unnamed", ctx->split_buffers.size(), col_size, cols_per_split);
 
         const char * src = (const char *)data;
         for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
@@ -2174,7 +2174,7 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     } else {
         // Fallback to single buffer
         printf("Setting tensor %s data on single NUMA node %d\n",
-               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
+               tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
         ggml_backend_cpu_split_set_numa_affinity(ctx->numa_nodes[0]);
         memcpy(ctx->split_buffers[0], data, size);
     }
