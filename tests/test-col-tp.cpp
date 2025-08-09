@@ -60,9 +60,9 @@ int main() {
     // Reference computation on single GPU
     {
         ggml_init_params params = {
-            .mem_size = 1024*1024*16,
-            .mem_buffer = nullptr,
-            .no_alloc = true
+            /* mem_size   */ 1024*1024*16,
+            /* mem_buffer */ nullptr,
+            /* no_alloc   */ true
         };
         ggml_context * ctx = ggml_init(params);
 
@@ -101,9 +101,9 @@ int main() {
 
             // Fallback: use single GPU computation
             ggml_init_params params = {
-                .mem_size = 1024*1024*16,
-                .mem_buffer = nullptr,
-                .no_alloc = true
+                /* mem_size   */ 1024*1024*16,
+                /* mem_buffer */ nullptr,
+                /* no_alloc   */ true
             };
             ggml_context * ctx = ggml_init(params);
 
