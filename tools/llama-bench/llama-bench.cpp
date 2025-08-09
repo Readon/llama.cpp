@@ -184,6 +184,8 @@ static const char * split_mode_str(llama_split_mode mode) {
             return "layer";
         case LLAMA_SPLIT_MODE_ROW:
             return "row";
+        case LLAMA_SPLIT_MODE_COL:
+            return "col";
         default:
             GGML_ABORT("invalid split mode");
     }

@@ -12,6 +12,20 @@ function(llama_build source)
     install(TARGETS ${TEST_TARGET} RUNTIME)
 endfunction()
 
+function(llama_build_cuda_test source)
+    if (GGML_CUDA)
+        if (DEFINED LLAMA_TEST_NAME)
+            set(TEST_TARGET ${LLAMA_TEST_NAME})
+        else()
+            get_filename_component(TEST_TARGET ${source} NAME_WE)
+        endif()
+
+        add_executable(${TEST_TARGET} ${source})
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+        install(TARGETS ${TEST_TARGET} RUNTIME)
+    endif()
+endfunction()
+
 function(llama_test target)
     include(CMakeParseArguments)
     set(options)
@@ -184,6 +198,9 @@ llama_build_and_test(test-chat-template.cpp)
 llama_build_and_test(test-json-partial.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(test-regex-partial.cpp)
+
+# CUDA-specific tests
+llama_build_cuda_test(test-col-tp.cpp)
 
 llama_build_and_test(test-thread-safety.cpp ARGS -hf ggml-org/models -hff tinyllamas/stories15M-q4_0.gguf -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 

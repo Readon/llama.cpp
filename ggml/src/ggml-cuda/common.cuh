@@ -10,6 +10,10 @@
 #define GGML_COMMON_DECL_HIP
 #define GGML_COMMON_IMPL_HIP
 #else
+#ifdef GGML_CUDA_USE_NCCL
+#include <nccl.h>
+#endif
+
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #if defined(GGML_USE_MUSA)
@@ -854,6 +858,8 @@ struct ggml_backend_cuda_context {
 
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {
+
+
             ggml_cuda_set_device(device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&streams[device][stream], cudaStreamNonBlocking));
         }

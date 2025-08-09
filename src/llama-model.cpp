@@ -358,7 +358,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
-        if (ggml_backend_split_buffer_type_fn) {
+        auto ggml_backend_split_buffer_type_v2_fn = (ggml_backend_split_buffer_type_v2_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type_v2");
+        if (ggml_backend_split_buffer_type_fn || ggml_backend_split_buffer_type_v2_fn) {
             size_t dev_index = [&]() {
                 auto * reg = ggml_backend_dev_backend_reg(dev);
                 for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
@@ -368,10 +370,41 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
                 }
                 throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
             }();
-            auto * buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
+            ggml_backend_buffer_type_t buft = nullptr;
+            if (ggml_backend_split_buffer_type_v2_fn) {
+                buft = ggml_backend_split_buffer_type_v2_fn(dev_index, tensor_split, /*axis=row*/0);
+            } else {
+                buft = ggml_backend_split_buffer_type_fn(dev_index, tensor_split);
+            }
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
             }
+        }
+    } else if (split_mode == LLAMA_SPLIT_MODE_COL) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto ggml_backend_split_buffer_type_v2_fn = (ggml_backend_split_buffer_type_v2_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type_v2");
+        if (ggml_backend_split_buffer_type_v2_fn) {
+            size_t dev_index = [&]() {
+                auto * reg = ggml_backend_dev_backend_reg(dev);
+                for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                    if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                        return i;
+                    }
+                }
+                throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
+            }();
+            ggml_backend_buffer_type_t buft = ggml_backend_split_buffer_type_v2_fn(dev_index, tensor_split, /*axis=col*/1);
+            if (buft != nullptr) {
+                buft_list.emplace_back(dev, buft);
+                LLAMA_LOG_INFO("%s: using column-wise tensor parallelism on %s\n", __func__, ggml_backend_dev_name(dev));
+            } else {
+                LLAMA_LOG_WARN("%s: column-wise TP not supported by %s backend; falling back to non-split buffers\n",
+                               __func__, ggml_backend_dev_name(dev));
+            }
+        } else {
+            LLAMA_LOG_WARN("%s: column-wise TP not supported by %s backend; falling back to non-split buffers\n",
+                           __func__, ggml_backend_dev_name(dev));
         }
     }
 

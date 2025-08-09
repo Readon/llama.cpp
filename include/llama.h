@@ -183,7 +183,8 @@ extern "C" {
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE  = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER = 1, // split layers and KV across GPUs
-        LLAMA_SPLIT_MODE_ROW   = 2, // split layers and KV across GPUs, use tensor parallelism if supported
+        LLAMA_SPLIT_MODE_ROW   = 2, // split rows across GPUs (row-wise tensor parallel)
+        LLAMA_SPLIT_MODE_COL   = 3, // split columns across GPUs (column-wise tensor parallel) [experimental]
     };
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)

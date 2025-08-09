@@ -184,8 +184,10 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
-    // Split buffer type for tensor parallelism
+    // Split buffer type for tensor parallelism (row-wise)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
+    // Split buffer type v2 with axis (0=row, 1=col); backends may ignore unsupported axes
+    typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_v2_t)(int main_device, const float * tensor_split, int axis);
     // Set the number of threads for the backend
     typedef void                         (*ggml_backend_set_n_threads_t)(ggml_backend_t backend, int n_threads);
     // Get additional buffer types provided by the device (returns a NULL-terminated array)

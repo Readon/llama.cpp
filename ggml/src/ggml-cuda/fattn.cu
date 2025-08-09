@@ -10,6 +10,7 @@
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_CUDA_FATTN_MMA_AVAILABLE)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
@@ -31,6 +32,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+#else
+    // Fallback to tile-based implementation when MMA is not available
+    ggml_cuda_flash_attn_ext_tile_f16(ctx, dst);
+#endif
 }
 
 template <int DKQ, int DV>
