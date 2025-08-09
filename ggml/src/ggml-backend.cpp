@@ -2000,12 +2000,17 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
 struct ggml_backend_cpu_split_buffer_type_context {
     std::vector<float> tensor_split;
     int n_splits;
+    int n_numa_nodes;
 
     ggml_backend_cpu_split_buffer_type_context(const float * splits, int n) : n_splits(n) {
         tensor_split.resize(n);
         for (int i = 0; i < n; ++i) {
             tensor_split[i] = splits[i];
         }
+
+        // Get number of NUMA nodes (this is a simplified approach)
+        // In a real implementation, we would query the actual NUMA topology
+        n_numa_nodes = n_splits; // Assume each split corresponds to a NUMA node
     }
 };
 
@@ -2041,14 +2046,21 @@ static void * ggml_backend_cpu_split_buffer_get_base(ggml_backend_buffer_t buffe
 static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
 
-    // For column TP, we split along the last dimension (columns)
-    if (tensor->ne[1] > 1) {
-        // This is a matrix, split along columns
-        // Set tensor data to point to the first split for now
+    // For column TP on NUMA systems, we split along the last dimension (columns)
+    if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
+        // This is a matrix, split along columns across NUMA nodes
+        // For now, set tensor data to point to the first split
         // In a real implementation, this would need more sophisticated handling
+        // to coordinate computation across NUMA nodes
         tensor->data = ctx->split_buffers[0];
+
+        // TODO: Implement proper NUMA-aware tensor initialization
+        // This would involve:
+        // 1. Splitting tensor columns across NUMA nodes
+        // 2. Setting up inter-node communication for all-reduce
+        // 3. Coordinating computation scheduling across nodes
     } else {
-        // Vector or scalar, use first buffer
+        // Vector, scalar, or single NUMA node - use first buffer
         tensor->data = ctx->split_buffers[0];
     }
     GGML_UNUSED(buffer);
@@ -2186,6 +2198,29 @@ static const ggml_backend_buffer_type_i ggml_backend_cpu_split_buffer_type_inter
 };
 
 ggml_backend_buffer_type_t ggml_backend_cpu_split_buffer_type(const float * tensor_split) {
+    // Check if NUMA is available - column TP only makes sense with multiple CPU sockets
+    // We need to get the NUMA status through the CPU backend
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    bool numa_available = false;
+    if (dev) {
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto * is_numa_fn = (bool(*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
+        if (is_numa_fn) {
+            numa_available = is_numa_fn();
+        }
+    }
+
+    if (!numa_available) {
+        // Log a helpful message explaining why CPU column TP is not available
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "CPU column-wise tensor parallelism requires NUMA (multiple CPU sockets). "
+                           "Current system has only one NUMA node. Falling back to regular CPU buffer.\n");
+            warned = true;
+        }
+        return nullptr; // Column TP requires NUMA (multiple CPU sockets)
+    }
+
     // Count non-zero splits
     int n_splits = 0;
     for (int i = 0; i < 16 && tensor_split[i] > 0; ++i) { // Use 16 as max devices
