@@ -363,7 +363,7 @@ static void print_usage(int /* argc */, char ** argv) {
         printf("  -rpc, --rpc <rpc_servers>                 (default: %s)\n",
                join(cmd_params_defaults.rpc_servers, ",").c_str());
     }
-    printf("  -sm, --split-mode <none|layer|row>        (default: %s)\n",
+    printf("  -sm, --split-mode <none|layer|row|col>    (default: %s)\n",
            join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                       (default: %s)\n",
            join(cmd_params_defaults.main_gpu, ",").c_str());
@@ -599,6 +599,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_SPLIT_MODE_LAYER;
                     } else if (m == "row") {
                         mode = LLAMA_SPLIT_MODE_ROW;
+                    } else if (m == "col") {
+                        mode = LLAMA_SPLIT_MODE_COL;
                     } else {
                         invalid_param = true;
                         break;
