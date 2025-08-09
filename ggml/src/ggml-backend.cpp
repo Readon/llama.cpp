@@ -2108,8 +2108,8 @@ static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer
     // For column TP on NUMA systems, we split along the last dimension (columns)
     if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
         // This is a matrix, split along columns across NUMA nodes
-        printf("Initializing tensor %s [%ld,%ld] for column TP across %zu NUMA nodes\n",
-               tensor->name ? tensor->name : "unnamed", tensor->ne[0], tensor->ne[1], ctx->split_buffers.size());
+        printf("Initializing tensor %s [%lld,%lld] for column TP across %zu NUMA nodes\n",
+               tensor->name && tensor->name[0] ? tensor->name : "unnamed", (long long)tensor->ne[0], (long long)tensor->ne[1], ctx->split_buffers.size());
 
         // For column TP, we need to set up the tensor to point to the distributed data
         // The actual data distribution will be handled in set_tensor/get_tensor
@@ -2127,7 +2127,7 @@ static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer
         // Vector, scalar, or single NUMA node - use first buffer
         tensor->data = ctx->split_buffers[0];
         printf("Initializing tensor %s on single NUMA node %d\n",
-               tensor->name ? tensor->name : "unnamed", ctx->numa_nodes[0]);
+               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
     }
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
@@ -2143,7 +2143,7 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
         size_t cols_per_split = tensor->ne[1] / ctx->split_buffers.size();
 
         printf("Distributing tensor %s data across %zu NUMA nodes (col_size=%zu, cols_per_split=%zu)\n",
-               tensor->name ? tensor->name : "unnamed", ctx->split_buffers.size(), col_size, cols_per_split);
+               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->split_buffers.size(), col_size, cols_per_split);
 
         const char * src = (const char *)data;
         for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
@@ -2174,7 +2174,7 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     } else {
         // Fallback to single buffer
         printf("Setting tensor %s data on single NUMA node %d\n",
-               tensor->name ? tensor->name : "unnamed", ctx->numa_nodes[0]);
+               tensor->name && tensor->name[0] ? tensor->name : "unnamed", ctx->numa_nodes[0]);
         ggml_backend_cpu_split_set_numa_affinity(ctx->numa_nodes[0]);
         memcpy(ctx->split_buffers[0], data, size);
     }
@@ -2310,23 +2310,29 @@ static const ggml_backend_buffer_type_i ggml_backend_cpu_split_buffer_type_inter
 
 ggml_backend_buffer_type_t ggml_backend_cpu_split_buffer_type(const float * tensor_split) {
     // Check if NUMA is available - column TP only makes sense with multiple CPU sockets
-    // We need to get the NUMA status through the CPU backend
-    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    bool numa_available = false;
-    if (dev) {
-        auto * reg = ggml_backend_dev_backend_reg(dev);
-        auto * is_numa_fn = (bool(*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_is_numa");
-        if (is_numa_fn) {
-            numa_available = is_numa_fn();
-        }
-    }
+    bool numa_is_available = false;
 
-    if (!numa_available) {
+#if GGML_NUMA_AVAILABLE
+    // Direct NUMA check when NUMA support is compiled in
+    if (numa_available() >= 0) {
+        numa_is_available = true;
+    }
+#else
+    // NUMA support not compiled - always false
+    numa_is_available = false;
+#endif
+
+    if (!numa_is_available) {
         // Log a helpful message explaining why CPU column TP is not available
         static bool warned = false;
         if (!warned) {
+#if GGML_NUMA_AVAILABLE
             fprintf(stderr, "CPU column-wise tensor parallelism requires NUMA (multiple CPU sockets). "
                            "Current system has only one NUMA node. Falling back to regular CPU buffer.\n");
+#else
+            fprintf(stderr, "CPU column-wise tensor parallelism requires NUMA support. "
+                           "Please rebuild with -DGGML_NUMA=ON to enable NUMA support.\n");
+#endif
             warned = true;
         }
         return nullptr; // Column TP requires NUMA (multiple CPU sockets)
