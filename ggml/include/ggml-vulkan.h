@@ -22,6 +22,9 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t d
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
+// Vulkan column-wise tensor parallelism support
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_split_buffer_type(const float * tensor_split);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
 #ifdef  __cplusplus

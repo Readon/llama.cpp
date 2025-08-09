@@ -11135,11 +11135,19 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_vk_split_buffer_type") == 0) {
+        return (void *)ggml_backend_vk_split_buffer_type;
+    }
+    return NULL;
+    GGML_UNUSED(reg);
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
@@ -11850,5 +11858,14 @@ static void ggml_vk_check_results_1(ggml_backend_vk_context * ctx, ggml_cgraph *
     VK_LOG_DEBUG("END ggml_vk_check_results_1(" << tensor->name << ")");
 }
 #endif
+
+// Vulkan split buffer type for column-wise tensor parallelism
+ggml_backend_buffer_type_t ggml_backend_vk_split_buffer_type(const float * tensor_split) {
+    // For now, Vulkan backend doesn't support true multi-device split buffers
+    // Return nullptr to indicate fallback to regular buffer type
+    // This could be implemented in the future using multiple Vulkan devices
+    GGML_UNUSED(tensor_split);
+    return nullptr;
+}
 
 GGML_BACKEND_DL_IMPL(ggml_backend_vk_reg)

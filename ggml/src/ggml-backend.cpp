@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1991,6 +1993,226 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type;
+}
+
+// CPU split buffer type for column-wise tensor parallelism
+
+struct ggml_backend_cpu_split_buffer_type_context {
+    std::vector<float> tensor_split;
+    int n_splits;
+
+    ggml_backend_cpu_split_buffer_type_context(const float * splits, int n) : n_splits(n) {
+        tensor_split.resize(n);
+        for (int i = 0; i < n; ++i) {
+            tensor_split[i] = splits[i];
+        }
+    }
+};
+
+struct ggml_backend_cpu_split_buffer_context {
+    std::vector<void*> split_buffers;
+    std::vector<size_t> split_sizes;
+    size_t total_size;
+
+    ~ggml_backend_cpu_split_buffer_context() {
+        for (size_t i = 0; i < split_buffers.size(); ++i) {
+            if (split_buffers[i]) {
+                ggml_aligned_free(split_buffers[i], split_sizes[i]);
+            }
+        }
+    }
+};
+
+static const char * ggml_backend_cpu_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return "CPU_SPLIT";
+    GGML_UNUSED(buft);
+}
+
+static void ggml_backend_cpu_split_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
+    delete ctx;
+}
+
+static void * ggml_backend_cpu_split_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
+    return ctx->split_buffers.empty() ? nullptr : ctx->split_buffers[0];
+}
+
+static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
+
+    // For column TP, we split along the last dimension (columns)
+    if (tensor->ne[1] > 1) {
+        // This is a matrix, split along columns
+        // Set tensor data to point to the first split for now
+        // In a real implementation, this would need more sophisticated handling
+        tensor->data = ctx->split_buffers[0];
+    } else {
+        // Vector or scalar, use first buffer
+        tensor->data = ctx->split_buffers[0];
+    }
+    GGML_UNUSED(buffer);
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_UNUSED(offset);
+    ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
+
+    // For column TP, distribute data across splits
+    if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
+        size_t col_size = tensor->ne[0] * ggml_type_size(tensor->type);
+        size_t cols_per_split = tensor->ne[1] / ctx->split_buffers.size();
+
+        const char * src = (const char *)data;
+        for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
+            size_t start_col = i * cols_per_split;
+            size_t end_col = (i == ctx->split_buffers.size() - 1) ? tensor->ne[1] : (i + 1) * cols_per_split;
+            size_t cols_in_split = end_col - start_col;
+
+            char * dst = (char *)ctx->split_buffers[i];
+            for (size_t col = 0; col < cols_in_split; ++col) {
+                memcpy(dst + col * col_size,
+                       src + (start_col + col) * col_size,
+                       col_size);
+            }
+        }
+    } else {
+        // Fallback to single buffer
+        memcpy(ctx->split_buffers[0], data, size);
+    }
+}
+
+static void ggml_backend_cpu_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_UNUSED(offset);
+    ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
+
+    // For column TP, gather data from splits
+    if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
+        size_t col_size = tensor->ne[0] * ggml_type_size(tensor->type);
+        size_t cols_per_split = tensor->ne[1] / ctx->split_buffers.size();
+
+        char * dst = (char *)data;
+        for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
+            size_t start_col = i * cols_per_split;
+            size_t end_col = (i == ctx->split_buffers.size() - 1) ? tensor->ne[1] : (i + 1) * cols_per_split;
+            size_t cols_in_split = end_col - start_col;
+
+            const char * src = (const char *)ctx->split_buffers[i];
+            for (size_t col = 0; col < cols_in_split; ++col) {
+                memcpy(dst + (start_col + col) * col_size,
+                       src + col * col_size,
+                       col_size);
+            }
+        }
+    } else {
+        // Fallback to single buffer
+        memcpy(data, ctx->split_buffers[0], size);
+    }
+}
+
+static bool ggml_backend_cpu_split_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_cpu_split_buffer_set_tensor(buffer, dst, src->data, 0, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+}
+
+static const ggml_backend_buffer_i ggml_backend_cpu_split_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cpu_split_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cpu_split_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cpu_split_buffer_init_tensor,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ ggml_backend_cpu_split_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cpu_split_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_cpu_split_buffer_cpy_tensor,
+    /* .clear           = */ NULL,
+    /* .reset           = */ NULL,
+};
+
+static ggml_backend_buffer_t ggml_backend_cpu_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cpu_split_buffer_type_context * buft_ctx = (ggml_backend_cpu_split_buffer_type_context *)buft->context;
+
+    ggml_backend_cpu_split_buffer_context * ctx = new ggml_backend_cpu_split_buffer_context();
+    ctx->total_size = size;
+
+    // Allocate split buffers based on tensor_split ratios
+    size_t remaining_size = size;
+    for (int i = 0; i < buft_ctx->n_splits; ++i) {
+        size_t split_size;
+        if (i == buft_ctx->n_splits - 1) {
+            split_size = remaining_size; // Last split gets remainder
+        } else {
+            split_size = (size_t)(size * buft_ctx->tensor_split[i]);
+            remaining_size -= split_size;
+        }
+
+        void * split_buffer = ggml_aligned_malloc(split_size);
+        if (!split_buffer) {
+            for (size_t j = 0; j < ctx->split_buffers.size(); ++j) {
+                if (ctx->split_buffers[j]) {
+                    ggml_aligned_free(ctx->split_buffers[j], ctx->split_sizes[j]);
+                }
+            }
+            delete ctx;
+            return nullptr;
+        }
+
+        ctx->split_buffers.push_back(split_buffer);
+        ctx->split_sizes.push_back(split_size);
+    }
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_split_buffer_interface, ctx, size);
+}
+
+static size_t ggml_backend_cpu_split_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return TENSOR_ALIGNMENT;
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_split_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+    GGML_UNUSED(buft);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cpu_split_buffer_type_interface = {
+    /* .get_name         = */ ggml_backend_cpu_split_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cpu_split_buffer_type_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_cpu_split_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+    /* .is_host          = */ ggml_backend_cpu_split_buffer_type_is_host,
+};
+
+ggml_backend_buffer_type_t ggml_backend_cpu_split_buffer_type(const float * tensor_split) {
+    // Count non-zero splits
+    int n_splits = 0;
+    for (int i = 0; i < 16 && tensor_split[i] > 0; ++i) { // Use 16 as max devices
+        n_splits++;
+    }
+
+    if (n_splits <= 1) {
+        return nullptr; // Need at least 2 splits for column TP
+    }
+
+    static std::vector<std::unique_ptr<ggml_backend_buffer_type>> split_buffer_types;
+    static std::mutex mutex;
+
+    std::lock_guard<std::mutex> lock(mutex);
+
+    // Create a new buffer type for this split configuration
+    auto buft_ctx = std::make_unique<ggml_backend_cpu_split_buffer_type_context>(tensor_split, n_splits);
+    auto buft = std::make_unique<ggml_backend_buffer_type>();
+
+    buft->iface = ggml_backend_cpu_split_buffer_type_interface;
+    buft->device = nullptr; // CPU doesn't have a specific device
+    buft->context = buft_ctx.release();
+
+    ggml_backend_buffer_type * result = buft.get();
+    split_buffer_types.push_back(std::move(buft));
+
+    return result;
 }
 
 static const char * ggml_backend_cpu_buffer_from_ptr_type_get_name(ggml_backend_buffer_type_t buft) {

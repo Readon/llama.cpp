@@ -6630,6 +6630,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
+    if (strcmp(name, "ggml_backend_metal_split_buffer_type") == 0) {
+        return (void *)ggml_backend_metal_split_buffer_type;
+    }
 
     return NULL;
 
@@ -6670,6 +6673,15 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
     }
 
     return &g_ggml_backend_metal_reg;
+}
+
+// Metal split buffer type for column-wise tensor parallelism
+ggml_backend_buffer_type_t ggml_backend_metal_split_buffer_type(const float * tensor_split) {
+    // For now, Metal backend doesn't support true multi-device split buffers
+    // Return nullptr to indicate fallback to regular buffer type
+    // This could be implemented in the future using multiple Metal devices
+    GGML_UNUSED(tensor_split);
+    return nullptr;
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_metal_reg)

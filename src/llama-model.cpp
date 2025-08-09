@@ -382,6 +382,8 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
         }
     } else if (split_mode == LLAMA_SPLIT_MODE_COL) {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
+        // Try v2 function first (for CUDA backend)
         auto ggml_backend_split_buffer_type_v2_fn = (ggml_backend_split_buffer_type_v2_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type_v2");
         if (ggml_backend_split_buffer_type_v2_fn) {
@@ -398,13 +400,45 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
             if (buft != nullptr) {
                 buft_list.emplace_back(dev, buft);
                 LLAMA_LOG_INFO("%s: using column-wise tensor parallelism on %s\n", __func__, ggml_backend_dev_name(dev));
+            }
+        } else {
+            // Try backend-specific split buffer functions
+            const char * backend_name = ggml_backend_reg_name(reg);
+            ggml_backend_buffer_type_t buft = nullptr;
+
+            if (strcmp(backend_name, "CPU") == 0) {
+                // Use CPU split buffer type
+                buft = ggml_backend_cpu_split_buffer_type(tensor_split);
+            } else if (strcmp(backend_name, "Metal") == 0) {
+                // Try Metal split buffer type
+                auto ggml_backend_metal_split_buffer_type_fn = (ggml_backend_buffer_type_t(*)(const float*))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_split_buffer_type");
+                if (ggml_backend_metal_split_buffer_type_fn) {
+                    buft = ggml_backend_metal_split_buffer_type_fn(tensor_split);
+                }
+            } else if (strcmp(backend_name, "Vulkan") == 0) {
+                // Try Vulkan split buffer type
+                auto ggml_backend_vk_split_buffer_type_fn = (ggml_backend_buffer_type_t(*)(const float*))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_split_buffer_type");
+                if (ggml_backend_vk_split_buffer_type_fn) {
+                    buft = ggml_backend_vk_split_buffer_type_fn(tensor_split);
+                }
+            } else if (strcmp(backend_name, "OpenCL") == 0) {
+                // Try OpenCL split buffer type
+                auto ggml_backend_opencl_split_buffer_type_fn = (ggml_backend_buffer_type_t(*)(const float*))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_split_buffer_type");
+                if (ggml_backend_opencl_split_buffer_type_fn) {
+                    buft = ggml_backend_opencl_split_buffer_type_fn(tensor_split);
+                }
+            }
+
+            if (buft != nullptr) {
+                buft_list.emplace_back(dev, buft);
+                LLAMA_LOG_INFO("%s: using column-wise tensor parallelism on %s\n", __func__, ggml_backend_dev_name(dev));
             } else {
                 LLAMA_LOG_WARN("%s: column-wise TP not supported by %s backend; falling back to non-split buffers\n",
                                __func__, ggml_backend_dev_name(dev));
             }
-        } else {
-            LLAMA_LOG_WARN("%s: column-wise TP not supported by %s backend; falling back to non-split buffers\n",
-                           __func__, ggml_backend_dev_name(dev));
         }
     }
 

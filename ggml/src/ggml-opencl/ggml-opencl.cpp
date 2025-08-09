@@ -3326,11 +3326,19 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+static void * ggml_backend_opencl_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_opencl_split_buffer_type") == 0) {
+        return (void *)ggml_backend_opencl_split_buffer_type;
+    }
+    return NULL;
+    GGML_UNUSED(reg);
+}
+
 static struct ggml_backend_reg_i ggml_backend_opencl_reg_i = {
     /* .get_name         = */ ggml_backend_opencl_reg_get_name,
     /* .device_count     = */ ggml_backend_opencl_reg_device_count,
     /* .device_get       = */ ggml_backend_opencl_reg_device_get,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_opencl_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_opencl_reg(void) {
@@ -7311,4 +7319,13 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
 
     func(backend, tensor->src[0], tensor->src[1], tensor);
     return true;
+}
+
+// OpenCL split buffer type for column-wise tensor parallelism
+ggml_backend_buffer_type_t ggml_backend_opencl_split_buffer_type(const float * tensor_split) {
+    // For now, OpenCL backend doesn't support true multi-device split buffers
+    // Return nullptr to indicate fallback to regular buffer type
+    // This could be implemented in the future using multiple OpenCL devices
+    GGML_UNUSED(tensor_split);
+    return nullptr;
 }
