@@ -380,6 +380,27 @@ endforeach()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
+# Option to enable NUMA support for CPU column TP
+option(GGML_NUMA "Enable NUMA support for CPU column-wise tensor parallelism" OFF)
+
+if (GGML_NUMA)
+    if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+        find_library(NUMA_LIBRARY numa)
+        if (NUMA_LIBRARY)
+            target_link_libraries(ggml-base PRIVATE ${NUMA_LIBRARY})
+            target_compile_definitions(ggml-base PRIVATE GGML_USE_NUMA)
+            message(STATUS "NUMA support enabled - Found NUMA library: ${NUMA_LIBRARY}")
+        else()
+            message(FATAL_ERROR "NUMA library not found but GGML_NUMA is enabled. Please install libnuma-dev or disable GGML_NUMA.")
+        endif()
+    else()
+        message(WARNING "NUMA support is only available on Linux systems")
+        set(GGML_NUMA OFF CACHE BOOL "NUMA support disabled on non-Linux systems" FORCE)
+    endif()
+else()
+    message(STATUS "NUMA support disabled - CPU column TP will use regular memory allocation")
+endif()
+
 find_library(MATH_LIBRARY m)
 if (MATH_LIBRARY)
     if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})

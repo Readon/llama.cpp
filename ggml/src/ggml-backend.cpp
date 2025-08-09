@@ -25,6 +25,15 @@
 #include <memory>
 #include <mutex>
 
+// NUMA support for CPU column TP (only if enabled)
+#if defined(GGML_USE_NUMA) && defined(__gnu_linux__)
+#include <numa.h>
+#include <numaif.h>
+#define GGML_NUMA_AVAILABLE 1
+#else
+#define GGML_NUMA_AVAILABLE 0
+#endif
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -2001,32 +2010,82 @@ struct ggml_backend_cpu_split_buffer_type_context {
     std::vector<float> tensor_split;
     int n_splits;
     int n_numa_nodes;
+    std::vector<int> numa_node_ids;  // NUMA node IDs for each split
 
     ggml_backend_cpu_split_buffer_type_context(const float * splits, int n) : n_splits(n) {
         tensor_split.resize(n);
+        numa_node_ids.resize(n);
+
         for (int i = 0; i < n; ++i) {
             tensor_split[i] = splits[i];
         }
 
-        // Get number of NUMA nodes (this is a simplified approach)
-        // In a real implementation, we would query the actual NUMA topology
-        n_numa_nodes = n_splits; // Assume each split corresponds to a NUMA node
+        // Get actual NUMA topology information
+#if GGML_NUMA_AVAILABLE
+        if (numa_available() >= 0) {
+            n_numa_nodes = numa_max_node() + 1;
+            // Map splits to NUMA nodes
+            for (int i = 0; i < n; ++i) {
+                numa_node_ids[i] = i % n_numa_nodes;
+            }
+            printf("NUMA support enabled: %d nodes detected\n", n_numa_nodes);
+        } else {
+            n_numa_nodes = 1;
+            for (int i = 0; i < n; ++i) {
+                numa_node_ids[i] = 0;
+            }
+            printf("NUMA library available but no NUMA nodes detected\n");
+        }
+#else
+        n_numa_nodes = 1;
+        for (int i = 0; i < n; ++i) {
+            numa_node_ids[i] = 0;
+        }
+        printf("NUMA support not compiled - using single node allocation\n");
+#endif
     }
 };
 
 struct ggml_backend_cpu_split_buffer_context {
     std::vector<void*> split_buffers;
     std::vector<size_t> split_sizes;
+    std::vector<int> numa_nodes;     // NUMA node for each buffer
     size_t total_size;
 
     ~ggml_backend_cpu_split_buffer_context() {
         for (size_t i = 0; i < split_buffers.size(); ++i) {
             if (split_buffers[i]) {
+#if GGML_NUMA_AVAILABLE
+                // Free NUMA-allocated memory
+                numa_free(split_buffers[i], split_sizes[i]);
+#else
                 ggml_aligned_free(split_buffers[i], split_sizes[i]);
+#endif
             }
         }
     }
 };
+
+// NUMA-aware computation helper
+static void ggml_backend_cpu_split_set_numa_affinity(int numa_node) {
+#if GGML_NUMA_AVAILABLE
+    if (numa_available() >= 0) {
+        // Set thread affinity to specific NUMA node
+        struct bitmask *mask = numa_allocate_cpumask();
+        numa_node_to_cpus(numa_node, mask);
+        numa_sched_setaffinity(0, mask);  // 0 = current thread
+        numa_free_cpumask(mask);
+
+        // Also set memory policy to prefer this NUMA node
+        numa_set_preferred(numa_node);
+
+        printf("Thread bound to NUMA node %d\n", numa_node);
+    }
+#else
+    (void)numa_node;
+    // NUMA support not compiled - no thread affinity setting
+#endif
+}
 
 static const char * ggml_backend_cpu_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU_SPLIT";
@@ -2049,19 +2108,26 @@ static ggml_status ggml_backend_cpu_split_buffer_init_tensor(ggml_backend_buffer
     // For column TP on NUMA systems, we split along the last dimension (columns)
     if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
         // This is a matrix, split along columns across NUMA nodes
-        // For now, set tensor data to point to the first split
-        // In a real implementation, this would need more sophisticated handling
-        // to coordinate computation across NUMA nodes
-        tensor->data = ctx->split_buffers[0];
+        printf("Initializing tensor %s [%ld,%ld] for column TP across %zu NUMA nodes\n",
+               tensor->name ? tensor->name : "unnamed", tensor->ne[0], tensor->ne[1], ctx->split_buffers.size());
 
-        // TODO: Implement proper NUMA-aware tensor initialization
-        // This would involve:
-        // 1. Splitting tensor columns across NUMA nodes
-        // 2. Setting up inter-node communication for all-reduce
-        // 3. Coordinating computation scheduling across nodes
+        // For column TP, we need to set up the tensor to point to the distributed data
+        // The actual data distribution will be handled in set_tensor/get_tensor
+        tensor->data = ctx->split_buffers[0];  // Primary buffer for metadata
+
+        // Store NUMA layout information in tensor (if possible)
+        // This is a simplified approach - in a full implementation, we would need
+        // a more sophisticated way to track the distributed layout
+
+        printf("  Tensor data layout: columns split across %zu NUMA nodes\n", ctx->split_buffers.size());
+        for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
+            printf("    Split %zu: NUMA node %d, buffer %p\n", i, ctx->numa_nodes[i], ctx->split_buffers[i]);
+        }
     } else {
         // Vector, scalar, or single NUMA node - use first buffer
         tensor->data = ctx->split_buffers[0];
+        printf("Initializing tensor %s on single NUMA node %d\n",
+               tensor->name ? tensor->name : "unnamed", ctx->numa_nodes[0]);
     }
     GGML_UNUSED(buffer);
     return GGML_STATUS_SUCCESS;
@@ -2071,10 +2137,13 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
     GGML_UNUSED(offset);
     ggml_backend_cpu_split_buffer_context * ctx = (ggml_backend_cpu_split_buffer_context *)buffer->context;
 
-    // For column TP, distribute data across splits
+    // For column TP, distribute data across splits with NUMA awareness
     if (tensor->ne[1] > 1 && ctx->split_buffers.size() > 1) {
         size_t col_size = tensor->ne[0] * ggml_type_size(tensor->type);
         size_t cols_per_split = tensor->ne[1] / ctx->split_buffers.size();
+
+        printf("Distributing tensor %s data across %zu NUMA nodes (col_size=%zu, cols_per_split=%zu)\n",
+               tensor->name ? tensor->name : "unnamed", ctx->split_buffers.size(), col_size, cols_per_split);
 
         const char * src = (const char *)data;
         for (size_t i = 0; i < ctx->split_buffers.size(); ++i) {
@@ -2082,15 +2151,31 @@ static void ggml_backend_cpu_split_buffer_set_tensor(ggml_backend_buffer_t buffe
             size_t end_col = (i == ctx->split_buffers.size() - 1) ? tensor->ne[1] : (i + 1) * cols_per_split;
             size_t cols_in_split = end_col - start_col;
 
+            // Set thread affinity to the NUMA node for this split
+            ggml_backend_cpu_split_set_numa_affinity(ctx->numa_nodes[i]);
+
             char * dst = (char *)ctx->split_buffers[i];
+            printf("  Split %zu: copying %zu columns to NUMA node %d\n", i, cols_in_split, ctx->numa_nodes[i]);
+
+            // Copy data column by column to ensure proper memory layout
             for (size_t col = 0; col < cols_in_split; ++col) {
                 memcpy(dst + col * col_size,
                        src + (start_col + col) * col_size,
                        col_size);
             }
         }
+
+        // Reset thread affinity
+#if GGML_NUMA_AVAILABLE
+        if (numa_available() >= 0) {
+            numa_set_localalloc();  // Reset to local allocation policy
+        }
+#endif
     } else {
         // Fallback to single buffer
+        printf("Setting tensor %s data on single NUMA node %d\n",
+               tensor->name ? tensor->name : "unnamed", ctx->numa_nodes[0]);
+        ggml_backend_cpu_split_set_numa_affinity(ctx->numa_nodes[0]);
         memcpy(ctx->split_buffers[0], data, size);
     }
 }
@@ -2148,8 +2233,11 @@ static ggml_backend_buffer_t ggml_backend_cpu_split_buffer_type_alloc_buffer(ggm
 
     ggml_backend_cpu_split_buffer_context * ctx = new ggml_backend_cpu_split_buffer_context();
     ctx->total_size = size;
+    ctx->numa_nodes.resize(buft_ctx->n_splits);
 
-    // Allocate split buffers based on tensor_split ratios
+    printf("CPU Column TP: Allocating buffers across %d NUMA nodes\n", buft_ctx->n_numa_nodes);
+
+    // Allocate split buffers based on tensor_split ratios with NUMA awareness
     size_t remaining_size = size;
     for (int i = 0; i < buft_ctx->n_splits; ++i) {
         size_t split_size;
@@ -2160,11 +2248,34 @@ static ggml_backend_buffer_t ggml_backend_cpu_split_buffer_type_alloc_buffer(ggm
             remaining_size -= split_size;
         }
 
-        void * split_buffer = ggml_aligned_malloc(split_size);
+        int numa_node = buft_ctx->numa_node_ids[i];
+        ctx->numa_nodes[i] = numa_node;
+
+        void * split_buffer = nullptr;
+
+#if GGML_NUMA_AVAILABLE
+        if (numa_available() >= 0) {
+            // Allocate memory on specific NUMA node
+            split_buffer = numa_alloc_onnode(split_size, numa_node);
+            printf("  Split %d: %zu bytes on NUMA node %d (ptr=%p)\n", i, split_size, numa_node, split_buffer);
+        } else {
+            split_buffer = ggml_aligned_malloc(split_size);
+            printf("  Split %d: %zu bytes using regular allocation (ptr=%p)\n", i, split_size, split_buffer);
+        }
+#else
+        split_buffer = ggml_aligned_malloc(split_size);
+        printf("  Split %d: %zu bytes using regular allocation (ptr=%p)\n", i, split_size, split_buffer);
+#endif
+
         if (!split_buffer) {
+            printf("Failed to allocate split buffer %d of size %zu on NUMA node %d\n", i, split_size, numa_node);
             for (size_t j = 0; j < ctx->split_buffers.size(); ++j) {
                 if (ctx->split_buffers[j]) {
+#if GGML_NUMA_AVAILABLE
+                    numa_free(ctx->split_buffers[j], ctx->split_sizes[j]);
+#else
                     ggml_aligned_free(ctx->split_buffers[j], ctx->split_sizes[j]);
+#endif
                 }
             }
             delete ctx;
