@@ -36,27 +36,27 @@ int main() {
     const int64_t M = 128;  // rows of W
     const int64_t K = 256;  // cols of W, rows of x
     const int64_t N = 64;   // cols of x
-    
+
     printf("Testing column-wise TP: W[%ld,%ld] @ x[%ld,%ld] -> y[%ld,%ld]\n", M, K, K, N, M, N);
-    
+
     // Initialize backends
     ggml_backend_load_all();
-    
+
     // Check if we have at least 2 CUDA devices
     if (ggml_backend_cuda_get_device_count() < 2) {
         printf("Need at least 2 CUDA devices for column TP test\n");
         return 77; // skip test
     }
-    
+
     // Create test data
     std::vector<float> W_data(M * K);
     std::vector<float> x_data(K * N);
     std::vector<float> y_ref(M * N);
     std::vector<float> y_col_tp(M * N);
-    
+
     fill_random(W_data.data(), W_data.size(), 0.1f);
     fill_random(x_data.data(), x_data.size(), 0.1f);
-    
+
     // Reference computation on single GPU
     {
         ggml_init_params params = {
@@ -87,7 +87,7 @@ int main() {
         ggml_backend_free(backend);
         ggml_free(ctx);
     }
-    
+
     // Column TP computation - for now just test that split buffer type can be created
     {
         printf("Testing column split buffer type creation...\n");
@@ -133,18 +133,17 @@ int main() {
             std::copy(y_ref.begin(), y_ref.end(), y_col_tp.begin());
         }
     }
-    
+
     // Compare results
     bool passed = allclose(y_col_tp.data(), y_ref.data(), y_ref.size());
-    
+
     printf("Column TP test: %s\n", passed ? "PASSED" : "FAILED");
-    
+
     if (!passed) {
         printf("First few values:\n");
         for (int i = 0; i < std::min(10, (int)y_ref.size()); ++i) {
             printf("  [%d] ref=%f col_tp=%f\n", i, y_ref[i], y_col_tp[i]);
         }
     }
-    
     return passed ? 0 : 1;
 }
