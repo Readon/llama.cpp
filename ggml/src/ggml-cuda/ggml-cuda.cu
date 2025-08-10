@@ -48,6 +48,23 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/convert.cuh"
+
+#ifdef GGML_CUDA_USE_NCCL
+#include <nccl.h>
+
+static ncclComm_t g_nccl_comm = nullptr;
+static bool g_nccl_initialized = false;
+
+#define NCCLCHECK(cmd) do {                         \
+  ncclResult_t r = cmd;                             \
+  if (r!= ncclSuccess) {                            \
+    printf("Failed, NCCL error %s:%d '%s'\n",      \
+        __FILE__,__LINE__,ncclGetErrorString(r));   \
+    exit(EXIT_FAILURE);                             \
+  }                                                 \
+} while(0)
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -786,20 +803,92 @@ static void get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tens
     }
 }
 
+// Identify tensor type for proper column splitting strategy
+enum tensor_split_type {
+    TENSOR_SPLIT_TYPE_NORMAL,      // Regular column split
+    TENSOR_SPLIT_TYPE_ATTENTION_QKV, // Q/K/V weights - split by attention heads
+    TENSOR_SPLIT_TYPE_ATTENTION_OUT, // Output weights - split by rows (not columns)
+    TENSOR_SPLIT_TYPE_FFN_GATE_UP,   // FFN gate/up weights - split by columns
+    TENSOR_SPLIT_TYPE_FFN_DOWN       // FFN down weights - split by rows (not columns)
+};
+
+static tensor_split_type get_tensor_split_type(const ggml_tensor * tensor) {
+    if (!tensor->name) {
+        return TENSOR_SPLIT_TYPE_NORMAL;
+    }
+
+    std::string name(tensor->name);
+
+    // Attention weights
+    if (name.find(".attn_q.weight") != std::string::npos ||
+        name.find(".attn_k.weight") != std::string::npos ||
+        name.find(".attn_v.weight") != std::string::npos) {
+        return TENSOR_SPLIT_TYPE_ATTENTION_QKV;
+    }
+
+    if (name.find(".attn_output.weight") != std::string::npos) {
+        return TENSOR_SPLIT_TYPE_ATTENTION_OUT;
+    }
+
+    // FFN weights
+    if (name.find(".ffn_gate.weight") != std::string::npos ||
+        name.find(".ffn_up.weight") != std::string::npos) {
+        return TENSOR_SPLIT_TYPE_FFN_GATE_UP;
+    }
+
+    if (name.find(".ffn_down.weight") != std::string::npos) {
+        return TENSOR_SPLIT_TYPE_FFN_DOWN;
+    }
+
+    return TENSOR_SPLIT_TYPE_NORMAL;
+}
+
 static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tensor * tensor, const std::array<float, GGML_CUDA_MAX_DEVICES> & tensor_split, int id) {
     const int64_t ncols = tensor->ne[0]; // K dimension for weight matrix
-    // For column splits, use simple rounding to 32 elements (256 bytes for fp16)
-    const int64_t rounding = 32;
 
-    *col_low = id == 0 ? 0 : ncols*tensor_split[id];
-    *col_low -= *col_low % rounding;
+    tensor_split_type split_type = get_tensor_split_type(tensor);
 
-    if (id == ggml_backend_cuda_get_device_count() - 1) {
-        *col_high = ncols;
-    } else {
-        *col_high = ncols*tensor_split[id + 1];
-        *col_high -= *col_high % rounding;
+    // For attention output and FFN down weights, these should actually be row-split, not column-split
+    // But since we're in column-split mode, we'll treat them specially
+    if (split_type == TENSOR_SPLIT_TYPE_ATTENTION_OUT || split_type == TENSOR_SPLIT_TYPE_FFN_DOWN) {
+        // These weights should be row-split in proper tensor parallelism
+        // For now, we'll split them by columns but this is not optimal
+        fprintf(stderr, "WARNING: %s should use row-wise splitting for proper tensor parallelism\n", tensor->name);
     }
+
+    // For Q/K/V weights, split by attention heads
+    if (split_type == TENSOR_SPLIT_TYPE_ATTENTION_QKV) {
+        // For Q/K/V weights, we want to split by attention heads
+        // The input dimension (ncols) should be split to ensure each device handles complete heads
+        const int64_t rounding = 64; // Round to head boundaries (typical head_dim = 64, 128, etc.)
+
+        *col_low = id == 0 ? 0 : (int64_t)(ncols * tensor_split[id]);
+        *col_low -= *col_low % rounding;
+
+        if (id == ggml_backend_cuda_get_device_count() - 1) {
+            *col_high = ncols;
+        } else {
+            *col_high = (int64_t)(ncols * tensor_split[id + 1]);
+            *col_high -= *col_high % rounding;
+        }
+    } else {
+        // Regular column split for other weights
+        const int64_t rounding = 32; // For quantized types, round to 32 elements
+
+        *col_low = id == 0 ? 0 : (int64_t)(ncols * tensor_split[id]);
+        *col_low -= *col_low % rounding;
+
+        if (id == ggml_backend_cuda_get_device_count() - 1) {
+            *col_high = ncols;
+        } else {
+            *col_high = (int64_t)(ncols * tensor_split[id + 1]);
+            *col_high -= *col_high % rounding;
+        }
+    }
+
+    // Ensure valid bounds
+    *col_low = std::max((int64_t)0, std::min(*col_low, ncols));
+    *col_high = std::max(*col_low, std::min(*col_high, ncols));
 }
 
 static size_t ggml_nbytes_split(const struct ggml_tensor * tensor, int nrows_split) {
@@ -907,7 +996,14 @@ static enum ggml_status ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_
             get_col_split(&col_low, &col_high, tensor, buft_ctx->tensor_split, id);
 
             int64_t ncols_split = col_high - col_low;
-            if (ncols_split == 0) {
+            if (ncols_split <= 0) {
+                continue;
+            }
+
+            // Validate column split parameters
+            if (col_low < 0 || col_high > tensor->ne[0] || col_low >= col_high) {
+                fprintf(stderr, "Invalid column split in init_tensor: device=%d, col_low=%ld, col_high=%ld, ne0=%ld\n",
+                        id, col_low, col_high, tensor->ne[0]);
                 continue;
             }
 
@@ -973,14 +1069,39 @@ static void ggml_backend_cuda_split_buffer_set_tensor(ggml_backend_buffer_t buff
             }
 
             // For column split, copy strided data: each row's [col_low:col_high] slice
-            const size_t elem_size = ggml_type_size(tensor->type);
             const int64_t nrows = ggml_nrows(tensor);
+
+            // Validate parameters before copying
+            if (ncols_split <= 0 || col_low < 0 || col_high > tensor->ne[0]) {
+                fprintf(stderr, "Invalid column split parameters: ncols_split=%ld, col_low=%ld, col_high=%ld, ne0=%ld\n",
+                        ncols_split, col_low, col_high, tensor->ne[0]);
+                continue;
+            }
+
+            // Calculate correct row sizes for quantized types
+            const size_t src_row_size = ggml_row_size(tensor->type, ncols_split);
+            const size_t dst_row_size = ggml_row_size(tensor->type, ncols_split);
+            const size_t col_offset_bytes = ggml_row_size(tensor->type, col_low);
+
+            // Debug output
+            fprintf(stderr, "DEBUG: Column split device %d: tensor=%s, ncols_split=%ld, col_low=%ld, col_high=%ld, ne0=%ld, nrows=%ld, src_row_size=%zu, nb1=%zu\n",
+                    id, tensor->name, ncols_split, col_low, col_high, tensor->ne[0], nrows, src_row_size, nb1);
 
             ggml_cuda_set_device(id);
             for (int64_t row = 0; row < nrows; ++row) {
-                const char * src_row = (const char *)data + row * nb1 + col_low * elem_size;
-                char * dst_row = (char *)extra->data_device[id] + row * ncols_split * elem_size;
-                CUDA_CHECK(cudaMemcpyAsync(dst_row, src_row, ncols_split * elem_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                const char * src_row = (const char *)data + row * nb1 + col_offset_bytes;
+                char * dst_row = (char *)extra->data_device[id] + row * dst_row_size;
+
+                // Validate memory addresses and size
+                if (src_row_size > 0) {
+                    // Additional validation
+                    if (src_row < (const char *)data || dst_row < (char *)extra->data_device[id]) {
+                        fprintf(stderr, "ERROR: Invalid memory address at row %ld: src_row=%p, dst_row=%p\n",
+                                row, src_row, dst_row);
+                        continue;
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(dst_row, src_row, src_row_size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+                }
             }
         }
     }
@@ -1035,14 +1156,28 @@ static void ggml_backend_cuda_split_buffer_get_tensor(ggml_backend_buffer_t buff
             }
 
             // For column split, copy strided data back: each row's [col_low:col_high] slice
-            const size_t elem_size = ggml_type_size(tensor->type);
             const int64_t nrows = ggml_nrows(tensor);
+
+            // Validate parameters before copying
+            if (ncols_split <= 0 || col_low < 0 || col_high > tensor->ne[0]) {
+                fprintf(stderr, "Invalid column split parameters in get_tensor: ncols_split=%ld, col_low=%ld, col_high=%ld, ne0=%ld\n",
+                        ncols_split, col_low, col_high, tensor->ne[0]);
+                continue;
+            }
+
+            // Calculate correct row sizes for quantized types
+            const size_t src_row_size = ggml_row_size(tensor->type, ncols_split);
+            const size_t col_offset_bytes = ggml_row_size(tensor->type, col_low);
 
             ggml_cuda_set_device(id);
             for (int64_t row = 0; row < nrows; ++row) {
-                const char * src_row = (const char *)extra->data_device[id] + row * ncols_split * elem_size;
-                char * dst_row = (char *)data + row * nb1 + col_low * elem_size;
-                CUDA_CHECK(cudaMemcpyAsync(dst_row, src_row, ncols_split * elem_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                const char * src_row = (const char *)extra->data_device[id] + row * src_row_size;
+                char * dst_row = (char *)data + row * nb1 + col_offset_bytes;
+
+                // Validate memory addresses and size
+                if (src_row_size > 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(dst_row, src_row, src_row_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+                }
             }
         }
     }
@@ -2097,7 +2232,7 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 #ifdef GGML_CUDA_USE_NCCL
 static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // Column-wise tensor parallel matmul: src0 is column-split, compute partial results and all-reduce
-    GGML_ASSERT(src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32);
+    // Support both floating point and quantized types
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
@@ -2105,9 +2240,8 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
     auto & tensor_split = buft_ctx->tensor_split;
 
     const int ndev = ggml_backend_cuda_get_device_count();
-    const int64_t ne00 = src0->ne[0]; // K dimension
     const int64_t ne01 = src0->ne[1]; // M dimension
-    const int64_t ne10 = src1->ne[0]; // K dimension (should match ne00 total)
+    const int64_t ne10 = src1->ne[0]; // K dimension
     const int64_t ne11 = src1->ne[1]; // N dimension
 
     // Allocate temporary buffers for partial results on each device
@@ -2144,15 +2278,37 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
 
         // Compute partial result: dst_partial = src0_shard @ src1_slice
         // src0_shard: [ne01, ncols_split], src1_slice: [ncols_split, ne11] -> dst_partial: [ne01, ne11]
+
+        // For quantized types, we need to dequantize src0_shard first
+        const bool is_quantized = ggml_is_quantized(src0->type);
+        void* src0_fp32 = nullptr;
+
+        if (is_quantized) {
+            // Allocate buffer for dequantized src0_shard
+            const size_t src0_fp32_size = ne01 * ncols_split * sizeof(float);
+            CUDA_CHECK(ggml_cuda_device_malloc(&src0_fp32, src0_fp32_size, id));
+
+            // Get the dequantization function and dequantize src0_shard to fp32
+            to_fp32_cuda_t dequantize_func = ggml_get_to_fp32_cuda(src0->type);
+            if (dequantize_func) {
+                dequantize_func(src0_shard, (float*)src0_fp32, ne01 * ncols_split, ctx.stream());
+            } else {
+                GGML_ABORT("Unsupported quantization type for tensor parallelism");
+            }
+        }
+
+        // Use cuBLAS for matrix multiplication
         const float alpha = 1.0f, beta = 0.0f;
         cublasHandle_t cublas_handle = ctx.cublas_handle();
 
-        if (src0->type == GGML_TYPE_F32) {
+        if (is_quantized || src0->type == GGML_TYPE_F32) {
+            // Use F32 GEMM for quantized types (after dequantization) or native F32
+            const float* src0_data = is_quantized ? (const float*)src0_fp32 : (const float*)src0_shard;
             CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
                 ne11, ne01, ncols_split,
                 &alpha,
                 (const float*)src1_slice, ne11,
-                (const float*)src0_shard, ncols_split,
+                src0_data, ncols_split,
                 &beta,
                 (float*)dst_partial[id], ne11));
         } else if (src0->type == GGML_TYPE_F16) {
@@ -2164,9 +2320,23 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
                 &beta,
                 dst_partial[id], CUDA_R_32F, ne11,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        } else if (src0->type == GGML_TYPE_BF16) {
+            CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                ne11, ne01, ncols_split,
+                &alpha,
+                src1_slice, CUDA_R_32F, ne11,
+                src0_shard, CUDA_R_16BF, ncols_split,
+                &beta,
+                dst_partial[id], CUDA_R_32F, ne11,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         }
 
-        CUDA_CHECK(ggml_cuda_device_free(src1_slice, id));
+        // Clean up dequantized buffer if used
+        if (src0_fp32) {
+            CUDA_CHECK(cudaFree(src0_fp32));
+        }
+
+        CUDA_CHECK(cudaFree(src1_slice));
     }
 
     // All-reduce partial results using NCCL
@@ -2199,7 +2369,7 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
     for (int id = 0; id < ndev; ++id) {
         if (dst_partial[id] != nullptr) {
             ggml_cuda_set_device(id);
-            CUDA_CHECK(ggml_cuda_device_free(dst_partial[id], id));
+            CUDA_CHECK(cudaFree(dst_partial[id]));
         }
     }
 }
@@ -2735,21 +2905,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
     }
 
     return true;
-#ifdef GGML_CUDA_USE_NCCL
-static ncclComm_t g_nccl_comm = nullptr;
-static int g_nccl_ndev = 0;
-static bool g_nccl_initialized = false;
-
-#define NCCLCHECK(cmd) do {                         \
-  ncclResult_t r = cmd;                             \
-  if (r!= ncclSuccess) {                            \
-    printf("Failed, NCCL error %s:%d '%s'\n",      \
-        __FILE__,__LINE__,ncclGetErrorString(r));   \
-    exit(EXIT_FAILURE);                             \
-  }                                                 \
-} while(0)
-#endif
-
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3965,8 +4120,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int mai
     ctx->main_device = main_device;
     ctx->axis = axis;
 
+    // Initialize tensor_split array properly
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
-        ctx->tensor_split[i] = tensor_split[i];
+        ctx->tensor_split[i] = tensor_split ? tensor_split[i] : 0.0f;
     }
 
     ctx->name = GGML_CUDA_NAME "_Split";
@@ -3993,6 +4149,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int mai
             tensor_split_arr[i] /= split_sum;
         }
     }
+
+    // Copy the processed tensor_split to context
+    ctx->tensor_split = tensor_split_arr;
 
     auto key = std::make_tuple(main_device, tensor_split_arr, axis);
     auto it = buft_map.find(key);
@@ -4080,13 +4239,14 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
             std::vector<int> devs(ndev);
             for (int i = 0; i < ndev; ++i) devs[i] = i;
             ncclUniqueId id;
-            if (device == 0) {
+            int current_device;
+            CUDA_CHECK(cudaGetDevice(&current_device));
+            if (current_device == 0) {
                 NCCLCHECK(ncclGetUniqueId(&id));
             }
             // Broadcast the id via cudaMemcpyPeer if possible, else assume single-process
             // For simplicity in this first cut, initialize single-process communicator with ranks 0..ndev-1
             NCCLCHECK(ncclCommInitAll(&g_nccl_comm, ndev, devs.data()));
-            g_nccl_ndev = ndev;
             g_nccl_initialized = true;
         }
     }

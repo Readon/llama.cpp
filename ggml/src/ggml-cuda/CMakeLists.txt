@@ -115,7 +115,33 @@ if (CUDAToolkit_FOUND)
     endif()
 
     # Optional: NCCL for CUDA collectives
+    # Try to find NCCL using find_package first
     find_package(NCCL QUIET)
+
+    # If not found, try manual detection
+    if (NOT NCCL_FOUND)
+        find_path(NCCL_INCLUDE_DIR nccl.h
+            PATHS /usr/include /usr/local/include /usr/local/cuda/include
+            PATH_SUFFIXES nccl
+        )
+
+        find_library(NCCL_LIBRARY nccl
+            PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64
+            PATH_SUFFIXES lib lib64
+        )
+
+        if (NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+            set(NCCL_FOUND TRUE)
+            # Create imported target
+            add_library(NCCL::NCCL SHARED IMPORTED)
+            set_target_properties(NCCL::NCCL PROPERTIES
+                IMPORTED_LOCATION "${NCCL_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}"
+            )
+            message(STATUS "NCCL manually found at ${NCCL_LIBRARY}")
+        endif()
+    endif()
+
     if (NCCL_FOUND)
         target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
         add_compile_definitions(GGML_CUDA_USE_NCCL)
