@@ -2341,15 +2341,45 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
 
     // All-reduce partial results using NCCL
     if (g_nccl_initialized && ndev > 1) {
+        // Count actual devices with data
+        int active_devices = 0;
         for (int id = 0; id < ndev; ++id) {
-            if (dst_partial[id] == nullptr) continue;
-            ggml_cuda_set_device(id);
-            NCCLCHECK(ncclAllReduce(dst_partial[id], dst_partial[id], ggml_nelements(dst), ncclFloat32, ncclSum, g_nccl_comm, ctx.stream()));
+            if (dst_partial[id] != nullptr) active_devices++;
         }
 
-        // Copy result from device 0 to dst
-        ggml_cuda_set_device(0);
-        CUDA_CHECK(cudaMemcpy(dst->data, dst_partial[0], dst_partial_size, cudaMemcpyDeviceToHost));
+        if (active_devices > 1) {
+            fprintf(stderr, "NCCL: Would perform all-reduce across %d devices (temporarily disabled)\n", active_devices);
+            // TODO: Fix NCCL all-reduce implementation
+            // For now, manually sum the partial results on host
+            std::vector<float> host_sum(ggml_nelements(dst), 0.0f);
+
+            for (int id = 0; id < ndev; ++id) {
+                if (dst_partial[id] == nullptr) continue;
+
+                ggml_cuda_set_device(id);
+                std::vector<float> device_partial(ggml_nelements(dst));
+                CUDA_CHECK(cudaMemcpy(device_partial.data(), dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
+
+                // Add to sum
+                for (size_t i = 0; i < host_sum.size(); ++i) {
+                    host_sum[i] += device_partial[i];
+                }
+            }
+
+            // Copy summed result to dst
+            memcpy(dst->data, host_sum.data(), dst_partial_size);
+        } else {
+            fprintf(stderr, "NCCL: Only %d active device(s), skipping all-reduce\n", active_devices);
+
+            // Find the first valid device and copy its result
+            for (int id = 0; id < ndev; ++id) {
+                if (dst_partial[id] != nullptr) {
+                    ggml_cuda_set_device(id);
+                    CUDA_CHECK(cudaMemcpy(dst->data, dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
+                    break;
+                }
+            }
+        }
     } else {
         // Fallback: copy partials to host and sum manually
         std::vector<float> host_partial(ggml_nelements(dst), 0.0f);
@@ -4236,18 +4266,44 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     if (!g_nccl_initialized) {
         const int ndev = ggml_backend_cuda_get_device_count();
         if (ndev > 1) {
-            std::vector<int> devs(ndev);
-            for (int i = 0; i < ndev; ++i) devs[i] = i;
-            ncclUniqueId id;
-            int current_device;
-            CUDA_CHECK(cudaGetDevice(&current_device));
-            if (current_device == 0) {
-                NCCLCHECK(ncclGetUniqueId(&id));
+            // Check if CUDA_VISIBLE_DEVICES is set and limits the visible devices
+            const char* visible_devices = getenv("CUDA_VISIBLE_DEVICES");
+            int actual_ndev = ndev;
+
+            if (visible_devices) {
+                // Count actual visible devices
+                std::string devices_str(visible_devices);
+                actual_ndev = 1; // At least one device
+                for (char c : devices_str) {
+                    if (c == ',') actual_ndev++;
+                }
+                actual_ndev = std::min(actual_ndev, ndev);
+                fprintf(stderr, "NCCL: Using %d devices (CUDA_VISIBLE_DEVICES=%s)\n", actual_ndev, visible_devices);
             }
-            // Broadcast the id via cudaMemcpyPeer if possible, else assume single-process
-            // For simplicity in this first cut, initialize single-process communicator with ranks 0..ndev-1
-            NCCLCHECK(ncclCommInitAll(&g_nccl_comm, ndev, devs.data()));
-            g_nccl_initialized = true;
+
+            if (actual_ndev > 1) {
+                std::vector<int> devs(actual_ndev);
+                for (int i = 0; i < actual_ndev; ++i) devs[i] = i;
+
+                ncclUniqueId id;
+                int current_device;
+                CUDA_CHECK(cudaGetDevice(&current_device));
+
+                // Generate unique ID on device 0
+                if (current_device == 0) {
+                    NCCLCHECK(ncclGetUniqueId(&id));
+                }
+
+                // Initialize NCCL communicator for single-process multi-GPU
+                fprintf(stderr, "NCCL: Initializing communicator for %d devices...\n", actual_ndev);
+                NCCLCHECK(ncclCommInitAll(&g_nccl_comm, actual_ndev, devs.data()));
+                fprintf(stderr, "NCCL: Communicator initialized successfully\n");
+                g_nccl_initialized = true;
+            } else {
+                fprintf(stderr, "NCCL: Only %d device(s) available, skipping NCCL initialization\n", actual_ndev);
+            }
+        } else {
+            fprintf(stderr, "NCCL: Only 1 device available, skipping NCCL initialization\n");
         }
     }
 #endif
