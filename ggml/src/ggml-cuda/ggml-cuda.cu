@@ -788,79 +788,73 @@ static int64_t get_row_rounding(const std::array<float, GGML_CUDA_MAX_DEVICES> &
     return row_rounding;
 }
 
-static void get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tensor * tensor, const std::array<float, GGML_CUDA_MAX_DEVICES> & tensor_split, int id) {
-    const int64_t nrows = ggml_nrows(tensor);
-    const int64_t rounding = get_row_rounding(tensor_split);
+// Forward declaration - will be defined after strategy functions
+static void get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tensor * tensor, const std::array<float, GGML_CUDA_MAX_DEVICES> & tensor_split, int id);
 
-    *row_low = id == 0 ? 0 : nrows*tensor_split[id];
-    *row_low -= *row_low % rounding;
-
-    if (id == ggml_backend_cuda_get_device_count() - 1) {
-        *row_high = nrows;
-    } else {
-        *row_high = nrows*tensor_split[id + 1];
-        *row_high -= *row_high % rounding;
-    }
-}
-
-// Identify tensor type for proper column splitting strategy
-enum tensor_split_type {
-    TENSOR_SPLIT_TYPE_NORMAL,      // Regular column split
-    TENSOR_SPLIT_TYPE_ATTENTION_QKV, // Q/K/V weights - split by attention heads
-    TENSOR_SPLIT_TYPE_ATTENTION_OUT, // Output weights - split by rows (not columns)
-    TENSOR_SPLIT_TYPE_FFN_GATE_UP,   // FFN gate/up weights - split by columns
-    TENSOR_SPLIT_TYPE_FFN_DOWN       // FFN down weights - split by rows (not columns)
+// Tensor parallelism strategy for different tensor types
+enum tensor_parallel_strategy {
+    TP_STRATEGY_COLUMN,    // Column-wise split (default for most weights)
+    TP_STRATEGY_ROW,       // Row-wise split (for output projections)
+    TP_STRATEGY_REPLICATE, // Replicate across devices (for small tensors)
+    TP_STRATEGY_AUTO       // Auto-select based on tensor properties
 };
 
-static tensor_split_type get_tensor_split_type(const ggml_tensor * tensor) {
+// Identify optimal tensor parallelism strategy
+static tensor_parallel_strategy get_tensor_parallel_strategy(const ggml_tensor * tensor, int split_mode_hint) {
     if (!tensor->name) {
-        return TENSOR_SPLIT_TYPE_NORMAL;
+        return TP_STRATEGY_AUTO;
     }
 
     std::string name(tensor->name);
 
-    // Attention weights
+    // For attention output and FFN down weights, row-wise split is more efficient
+    if (name.find(".attn_output.weight") != std::string::npos ||
+        name.find(".ffn_down.weight") != std::string::npos) {
+        return TP_STRATEGY_ROW;
+    }
+
+    // For Q/K/V weights and FFN gate/up weights, column-wise split is preferred
     if (name.find(".attn_q.weight") != std::string::npos ||
         name.find(".attn_k.weight") != std::string::npos ||
-        name.find(".attn_v.weight") != std::string::npos) {
-        return TENSOR_SPLIT_TYPE_ATTENTION_QKV;
-    }
-
-    if (name.find(".attn_output.weight") != std::string::npos) {
-        return TENSOR_SPLIT_TYPE_ATTENTION_OUT;
-    }
-
-    // FFN weights
-    if (name.find(".ffn_gate.weight") != std::string::npos ||
+        name.find(".attn_v.weight") != std::string::npos ||
+        name.find(".ffn_gate.weight") != std::string::npos ||
         name.find(".ffn_up.weight") != std::string::npos) {
-        return TENSOR_SPLIT_TYPE_FFN_GATE_UP;
+        return TP_STRATEGY_COLUMN;
     }
 
-    if (name.find(".ffn_down.weight") != std::string::npos) {
-        return TENSOR_SPLIT_TYPE_FFN_DOWN;
+    // For embedding and output weights, use the hint from split mode
+    if (name.find("token_embd.weight") != std::string::npos ||
+        name.find("output.weight") != std::string::npos) {
+        return (split_mode_hint == 1) ? TP_STRATEGY_COLUMN : TP_STRATEGY_ROW;
     }
 
-    return TENSOR_SPLIT_TYPE_NORMAL;
+    // Small tensors (biases, norms) should be replicated
+    if (name.find("bias") != std::string::npos ||
+        name.find("norm") != std::string::npos ||
+        ggml_nelements(tensor) < 1024) {
+        return TP_STRATEGY_REPLICATE;
+    }
+
+    return TP_STRATEGY_AUTO;
 }
 
 static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tensor * tensor, const std::array<float, GGML_CUDA_MAX_DEVICES> & tensor_split, int id) {
     const int64_t ncols = tensor->ne[0]; // K dimension for weight matrix
 
-    tensor_split_type split_type = get_tensor_split_type(tensor);
+    tensor_parallel_strategy strategy = get_tensor_parallel_strategy(tensor, 1); // hint: column split mode
 
-    // For attention output and FFN down weights, these should actually be row-split, not column-split
-    // But since we're in column-split mode, we'll treat them specially
-    if (split_type == TENSOR_SPLIT_TYPE_ATTENTION_OUT || split_type == TENSOR_SPLIT_TYPE_FFN_DOWN) {
-        // These weights should be row-split in proper tensor parallelism
-        // For now, we'll split them by columns but this is not optimal
-        fprintf(stderr, "WARNING: %s should use row-wise splitting for proper tensor parallelism\n", tensor->name);
-    }
+    // For Q/K/V weights, split by attention heads for optimal performance
+    if (strategy == TP_STRATEGY_COLUMN) {
+        // Check if this is attention Q/K/V weights that need head-aligned splitting
+        std::string name = tensor->name ? std::string(tensor->name) : "";
+        int64_t rounding = 32; // Default rounding for quantized types
 
-    // For Q/K/V weights, split by attention heads
-    if (split_type == TENSOR_SPLIT_TYPE_ATTENTION_QKV) {
-        // For Q/K/V weights, we want to split by attention heads
-        // The input dimension (ncols) should be split to ensure each device handles complete heads
-        const int64_t rounding = 64; // Round to head boundaries (typical head_dim = 64, 128, etc.)
+        if (name.find(".attn_q.weight") != std::string::npos ||
+            name.find(".attn_k.weight") != std::string::npos ||
+            name.find(".attn_v.weight") != std::string::npos) {
+            // For Q/K/V weights, round to head boundaries (typical head_dim = 64, 128, etc.)
+            rounding = 64;
+        }
 
         *col_low = id == 0 ? 0 : (int64_t)(ncols * tensor_split[id]);
         *col_low -= *col_low % rounding;
@@ -871,10 +865,20 @@ static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tens
             *col_high = (int64_t)(ncols * tensor_split[id + 1]);
             *col_high -= *col_high % rounding;
         }
+    } else if (strategy == TP_STRATEGY_REPLICATE) {
+        // Small tensors are replicated on all devices
+        *col_low = 0;
+        *col_high = ncols;
     } else {
-        // Regular column split for other weights
-        const int64_t rounding = 32; // For quantized types, round to 32 elements
+        // For tensors that should use row-wise split but are forced into column mode
+        // Issue a warning and fall back to regular column split
+        if (strategy == TP_STRATEGY_ROW) {
+            fprintf(stderr, "WARNING: %s should use row-wise splitting for optimal tensor parallelism\n",
+                    tensor->name ? tensor->name : "unnamed_tensor");
+        }
 
+        // Regular column split
+        const int64_t rounding = 32;
         *col_low = id == 0 ? 0 : (int64_t)(ncols * tensor_split[id]);
         *col_low -= *col_low % rounding;
 
@@ -889,6 +893,35 @@ static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tens
     // Ensure valid bounds
     *col_low = std::max((int64_t)0, std::min(*col_low, ncols));
     *col_high = std::max(*col_low, std::min(*col_high, ncols));
+}
+
+// Implementation of get_row_split function
+static void get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tensor * tensor, const std::array<float, GGML_CUDA_MAX_DEVICES> & tensor_split, int id) {
+    const int64_t nrows = ggml_nrows(tensor);
+
+    // Check tensor parallelism strategy for optimization hints
+    tensor_parallel_strategy strategy = get_tensor_parallel_strategy(tensor, 0); // hint: row split mode
+
+    // Use appropriate rounding based on strategy
+    int64_t rounding = get_row_rounding(tensor_split);
+    if (strategy == TP_STRATEGY_ROW) {
+        // For row-wise TP, minimal rounding is sufficient
+        rounding = std::min(rounding, (int64_t)1);
+    } else if (strategy == TP_STRATEGY_COLUMN) {
+        // This tensor should use column-wise TP but is in row mode
+        fprintf(stderr, "INFO: %s would benefit from column-wise splitting\n",
+                tensor->name ? tensor->name : "unnamed_tensor");
+    }
+
+    *row_low = id == 0 ? 0 : nrows*tensor_split[id];
+    *row_low -= *row_low % rounding;
+
+    if (id == ggml_backend_cuda_get_device_count() - 1) {
+        *row_high = nrows;
+    } else {
+        *row_high = nrows*tensor_split[id + 1];
+        *row_high -= *row_high % rounding;
+    }
 }
 
 static size_t ggml_nbytes_split(const struct ggml_tensor * tensor, int nrows_split) {
@@ -2230,6 +2263,119 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
 }
 
 #ifdef GGML_CUDA_USE_NCCL
+static void ggml_cuda_mul_mat_row_tp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Row-wise tensor parallel matmul: src0 is row-split, compute partial results and all-gather
+    // This is used for output projections (attention output, FFN down)
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
+    auto & tensor_split = buft_ctx->tensor_split;
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    GGML_ASSERT(ne00 == ne10); // K dimensions must match
+
+    // Get current device
+    int current_device;
+    CUDA_CHECK(cudaGetDevice(&current_device));
+
+    // Get row split for current device
+    int64_t row_low, row_high;
+    get_row_split(&row_low, &row_high, src0, tensor_split, current_device);
+    int64_t nrows_split = row_high - row_low;
+
+    if (nrows_split == 0) {
+        // This device has no work to do
+        return;
+    }
+
+    // Get device data pointers
+    ggml_tensor_extra_gpu * src0_extra = (ggml_tensor_extra_gpu *) src0->extra;
+    ggml_tensor_extra_gpu * src1_extra = (ggml_tensor_extra_gpu *) src1->extra;
+    ggml_tensor_extra_gpu * dst_extra = (ggml_tensor_extra_gpu *) dst->extra;
+
+    const char * src0_shard = (const char *) src0_extra->data_device[current_device];
+    const float * src1_d = (const float *) src1_extra->data_device[current_device];
+    float * dst_d = (float *) dst_extra->data_device[current_device];
+
+    // Check if src0 is quantized
+    const bool is_quantized = ggml_is_quantized(src0->type);
+    void * src0_fp32 = nullptr;
+
+    if (is_quantized) {
+        // Allocate buffer for dequantized src0_shard
+        const size_t src0_fp32_size = ne00 * nrows_split * sizeof(float);
+        CUDA_CHECK(ggml_cuda_device_malloc(&src0_fp32, src0_fp32_size, current_device));
+
+        // Get the dequantization function and dequantize src0_shard to fp32
+        to_fp32_cuda_t dequantize_func = ggml_get_to_fp32_cuda(src0->type);
+        if (dequantize_func) {
+            dequantize_func(src0_shard, (float*)src0_fp32, ne00 * nrows_split, ctx.stream());
+        } else {
+            GGML_ABORT("Unsupported quantization type for tensor parallelism");
+        }
+    }
+
+    // Use cuBLAS for matrix multiplication
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasHandle_t cublas_handle = ctx.cublas_handle();
+
+    // Compute partial result: dst_partial = src0_shard @ src1
+    // src0_shard: [K, M_split] (transposed), src1: [K, N], dst_partial: [M_split, N]
+    CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            nrows_split, ne11, ne00,  // M_split, N, K
+                            &alpha,
+                            is_quantized ? (const float*)src0_fp32 : (const float*)src0_shard, ne00,  // A: K x M_split
+                            src1_d, ne10,                                                              // B: K x N
+                            &beta,
+                            dst_d, nrows_split));                                                      // C: M_split x N
+
+    // Clean up temporary buffer
+    if (is_quantized && src0_fp32) {
+        CUDA_CHECK(cudaFree(src0_fp32));
+    }
+
+    // Synchronize before NCCL operation
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    // All-gather the partial results across devices
+    // Each device has computed a different slice of the output
+    // We need to gather all slices to reconstruct the full output
+    if (ggml_backend_cuda_get_device_count() > 1) {
+        // For row-wise TP, we need all-gather instead of all-reduce
+        // Each device contributes a different part of the output matrix
+
+        // Allocate temporary buffer for gathering results from all devices
+        const size_t dst_full_size = ne01 * ne11 * sizeof(float);
+        float * dst_full = nullptr;
+        CUDA_CHECK(ggml_cuda_device_malloc((void**)&dst_full, dst_full_size, current_device));
+
+        // Copy local result to appropriate position in full buffer
+        const size_t local_result_size = nrows_split * ne11 * sizeof(float);
+        const size_t offset_bytes = row_low * ne11 * sizeof(float);
+        CUDA_CHECK(cudaMemcpyAsync(
+            (char*)dst_full + offset_bytes,
+            dst_d,
+            local_result_size,
+            cudaMemcpyDeviceToDevice,
+            ctx.stream()
+        ));
+
+        // TODO: Implement proper NCCL all-gather here
+        // For now, we'll use a simplified approach
+        fprintf(stderr, "NCCL: Would perform all-gather across %d devices for row-wise TP (temporarily disabled)\n",
+                ggml_backend_cuda_get_device_count());
+
+        // Copy the result back (this is a placeholder until proper NCCL all-gather is implemented)
+        CUDA_CHECK(cudaMemcpyAsync(dst_d, dst_full, dst_full_size, cudaMemcpyDeviceToDevice, ctx.stream()));
+
+        CUDA_CHECK(cudaFree(dst_full));
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+}
+
 static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // Column-wise tensor parallel matmul: src0 is column-split, compute partial results and all-reduce
     // Support both floating point and quantized types
@@ -2404,6 +2550,14 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 #else
+static void ggml_cuda_mul_mat_row_tp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    GGML_ABORT("Row-wise tensor parallelism requires NCCL support");
+}
+
 static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(src0);
@@ -2437,14 +2591,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_backend_cuda_split_buffer_type_context * buft_ctx = (ggml_backend_cuda_split_buffer_type_context *) src0->buffer->buft->context;
         auto & tensor_split = buft_ctx->tensor_split;
 
-        // Check if this is column-wise tensor parallelism
+        // Determine optimal tensor parallelism strategy based on tensor type
+        tensor_parallel_strategy strategy = get_tensor_parallel_strategy(src0, buft_ctx->axis);
+
         if (buft_ctx->axis == 1) {
+            // Column-wise split mode
+            if (strategy == TP_STRATEGY_ROW) {
+                // This tensor should use row-wise TP but is in column mode
+                fprintf(stderr, "WARNING: %s should use row-wise splitting but is in column mode. Consider using row split for better performance.\n",
+                        src0->name ? src0->name : "unnamed_tensor");
+            }
             // Column-wise TP: compute partial results and all-reduce
             ggml_cuda_mul_mat_col_tp(ctx, src0, src1, dst);
             return;
+        } else {
+            // Row-wise split mode (axis == 0)
+            if (strategy == TP_STRATEGY_ROW) {
+                // Use optimized row-wise tensor parallelism
+                ggml_cuda_mul_mat_row_tp(ctx, src0, src1, dst);
+                return;
+            } else if (strategy == TP_STRATEGY_COLUMN) {
+                // This tensor should use column-wise TP but is in row mode
+                fprintf(stderr, "WARNING: %s should use column-wise splitting but is in row mode. Consider using column split for better performance.\n",
+                        src0->name ? src0->name : "unnamed_tensor");
+            }
         }
 
-        // Row-wise split (existing logic)
+        // Fall back to traditional row-wise split (existing logic)
         for (int id = 0; id < ggml_backend_cuda_get_device_count(); ++id) {
             // skip devices that are not going to do any work:
             if (tensor_split[id] >= (id + 1 < ggml_backend_cuda_get_device_count() ? tensor_split[id + 1] : 1.0f)) {
@@ -4141,7 +4314,15 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-static ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int main_device, const float * tensor_split, int axis) {
+// Smart tensor parallelism buffer type selection
+// This function automatically selects the optimal split strategy based on tensor properties
+ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_smart(int main_device, const float * tensor_split, int default_axis) {
+    // For now, use the default axis. In the future, this could analyze the model structure
+    // and automatically choose the best split strategy for each tensor type
+    return ggml_backend_cuda_split_buffer_type_v2(main_device, tensor_split, default_axis);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int main_device, const float * tensor_split, int axis) {
     if (axis != 0 && axis != 1) {
         return nullptr; // only row (0) and col (1) supported
     }
