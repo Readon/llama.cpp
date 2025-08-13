@@ -197,7 +197,32 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     // if using single GPU mode, remove all except the main GPU
-    if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
+    if (params.tp_n > 1) {
+        int n_gpu_groups = 0;
+        if (params.tensor_split != nullptr) {
+            for (int i = 0; i < llama_max_devices(); ++i) {
+                if (params.tensor_split[i] > 0.0f) {
+                    n_gpu_groups++;
+                }
+            }
+        }
+        // if tensor_split is not given, we assume 1 group
+        if (n_gpu_groups == 0) {
+            n_gpu_groups = 1;
+        }
+
+        const int n_gpus_required = n_gpu_groups * params.tp_n;
+
+        if ((int)model->devices.size() < n_gpus_required) {
+            LLAMA_LOG_ERROR("%s: not enough GPUs for %d groups with tp_n=%d (need %d, have %zu)\n",
+                __func__, n_gpu_groups, params.tp_n, n_gpus_required, model->devices.size());
+            llama_model_free(model);
+            return nullptr;
+        }
+
+        // trim the device list to the required number of GPUs
+        model->devices.resize(n_gpus_required);
+    } else if (params.split_mode == LLAMA_SPLIT_MODE_NONE) {
         if (params.main_gpu < 0) {
             model->devices.clear();
         } else {
