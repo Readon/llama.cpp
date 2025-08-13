@@ -55,6 +55,7 @@
 
 static ncclComm_t g_nccl_comm = nullptr;
 static bool g_nccl_initialized = false;
+static int g_nccl_size = 1;
 
 #define NCCLCHECK(cmd) do {                         \
   ncclResult_t r = cmd;                             \
@@ -64,6 +65,24 @@ static bool g_nccl_initialized = false;
     exit(EXIT_FAILURE);                             \
   }                                                 \
 } while(0)
+
+// NCCL collective operations wrapper
+static void nccl_all_reduce(void* data, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
+    if (!g_nccl_initialized || g_nccl_size <= 1) {
+        return; // No-op for single GPU
+    }
+    NCCLCHECK(ncclAllReduce(data, data, count, datatype, op, g_nccl_comm, stream));
+}
+
+static void nccl_all_gather(const void* sendbuf, void* recvbuf, size_t sendcount, ncclDataType_t datatype, cudaStream_t stream) {
+    if (!g_nccl_initialized || g_nccl_size <= 1) {
+        if (sendbuf != recvbuf) {
+            CUDA_CHECK(cudaMemcpyAsync(recvbuf, sendbuf, sendcount * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
+    NCCLCHECK(ncclAllGather(sendbuf, recvbuf, sendcount, datatype, g_nccl_comm, stream));
+}
 #endif
 #include "ggml.h"
 
@@ -2339,36 +2358,40 @@ static void ggml_cuda_mul_mat_row_tp(ggml_backend_cuda_context & ctx, const ggml
     // Synchronize before NCCL operation
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
 
-    // All-gather the partial results across devices
-    // Each device has computed a different slice of the output
-    // We need to gather all slices to reconstruct the full output
+    // All-gather the partial results across devices (following PyTorch RowwiseParallel pattern)
+    // Each device has computed a different slice of the output matrix
     if (ggml_backend_cuda_get_device_count() > 1) {
-        // For row-wise TP, we need all-gather instead of all-reduce
-        // Each device contributes a different part of the output matrix
-
-        // Allocate temporary buffer for gathering results from all devices
+        // Allocate buffer for the full output matrix
         const size_t dst_full_size = ne01 * ne11 * sizeof(float);
         float * dst_full = nullptr;
         CUDA_CHECK(ggml_cuda_device_malloc((void**)&dst_full, dst_full_size, current_device));
+        CUDA_CHECK(cudaMemsetAsync(dst_full, 0, dst_full_size, ctx.stream()));
 
-        // Copy local result to appropriate position in full buffer
-        const size_t local_result_size = nrows_split * ne11 * sizeof(float);
+        // Use NCCL all-gather to collect all partial results
+        const size_t local_result_elements = nrows_split * ne11;
+#ifdef GGML_CUDA_USE_NCCL
+        // All-gather: each device contributes its local result to form the complete output
+        nccl_all_gather(dst_d, dst_full, local_result_elements, ncclFloat32, ctx.stream());
+
+        // Synchronize after all-gather
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+        // Copy the complete result back to dst (dst_full now contains the full matrix)
+        CUDA_CHECK(cudaMemcpyAsync(dst_d, dst_full, dst_full_size, cudaMemcpyDeviceToDevice, ctx.stream()));
+#else
+        // Fallback: copy local result to appropriate position
         const size_t offset_bytes = row_low * ne11 * sizeof(float);
         CUDA_CHECK(cudaMemcpyAsync(
             (char*)dst_full + offset_bytes,
             dst_d,
-            local_result_size,
+            local_result_elements * sizeof(float),
             cudaMemcpyDeviceToDevice,
             ctx.stream()
         ));
 
-        // TODO: Implement proper NCCL all-gather here
-        // For now, we'll use a simplified approach
-        fprintf(stderr, "NCCL: Would perform all-gather across %d devices for row-wise TP (temporarily disabled)\n",
-                ggml_backend_cuda_get_device_count());
-
-        // Copy the result back (this is a placeholder until proper NCCL all-gather is implemented)
+        // Copy the complete result back to dst
         CUDA_CHECK(cudaMemcpyAsync(dst_d, dst_full, dst_full_size, cudaMemcpyDeviceToDevice, ctx.stream()));
+#endif
 
         CUDA_CHECK(cudaFree(dst_full));
     }
@@ -2423,7 +2446,7 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
         }
 
         // Compute partial result: dst_partial = src0_shard @ src1_slice
-        // src0_shard: [ne01, ncols_split], src1_slice: [ncols_split, ne11] -> dst_partial: [ne01, ne11]
+        // src0_shard: [ncols_split, ne01] (transposed), src1_slice: [ncols_split, ne11] -> dst_partial: [ne01, ne11]
 
         // For quantized types, we need to dequantize src0_shard first
         const bool is_quantized = ggml_is_quantized(src0->type);
@@ -2450,30 +2473,32 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
         if (is_quantized || src0->type == GGML_TYPE_F32) {
             // Use F32 GEMM for quantized types (after dequantization) or native F32
             const float* src0_data = is_quantized ? (const float*)src0_fp32 : (const float*)src0_shard;
-            CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                ne11, ne01, ncols_split,
+            // Matrix multiplication: C = A^T * B
+            // A (src0_data): [ncols_split, ne01], B (src1_slice): [ncols_split, ne11] -> C: [ne01, ne11]
+            CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ncols_split,  // M, N, K
                 &alpha,
-                (const float*)src1_slice, ne11,
-                src0_data, ncols_split,
+                src0_data, ncols_split,   // A: [ncols_split, ne01], lda = ncols_split
+                (const float*)src1_slice, ncols_split,  // B: [ncols_split, ne11], ldb = ncols_split
                 &beta,
-                (float*)dst_partial[id], ne11));
+                (float*)dst_partial[id], ne01));  // C: [ne01, ne11], ldc = ne01
         } else if (src0->type == GGML_TYPE_F16) {
-            CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                ne11, ne01, ncols_split,
+            CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ncols_split,
                 &alpha,
-                src1_slice, CUDA_R_32F, ne11,
                 src0_shard, CUDA_R_16F, ncols_split,
+                src1_slice, CUDA_R_32F, ncols_split,
                 &beta,
-                dst_partial[id], CUDA_R_32F, ne11,
+                dst_partial[id], CUDA_R_32F, ne01,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         } else if (src0->type == GGML_TYPE_BF16) {
-            CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                ne11, ne01, ncols_split,
+            CUBLAS_CHECK(cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ncols_split,
                 &alpha,
-                src1_slice, CUDA_R_32F, ne11,
                 src0_shard, CUDA_R_16BF, ncols_split,
+                src1_slice, CUDA_R_32F, ncols_split,
                 &beta,
-                dst_partial[id], CUDA_R_32F, ne11,
+                dst_partial[id], CUDA_R_32F, ne01,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         }
 
@@ -2485,60 +2510,42 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
         CUDA_CHECK(cudaFree(src1_slice));
     }
 
-    // All-reduce partial results using NCCL
-    if (g_nccl_initialized && ndev > 1) {
-        // Count actual devices with data
-        int active_devices = 0;
+    // All-reduce partial results using NCCL (following PyTorch pattern)
+    if (ndev > 1) {
+        // Perform all-reduce on each device's partial result
         for (int id = 0; id < ndev; ++id) {
-            if (dst_partial[id] != nullptr) active_devices++;
+            if (dst_partial[id] == nullptr) continue;
+
+            ggml_cuda_set_device(id);
+            const size_t dst_elements = ggml_nelements(dst);
+
+            // Use NCCL all-reduce to sum partial results across all devices
+#ifdef GGML_CUDA_USE_NCCL
+            nccl_all_reduce(dst_partial[id], dst_elements, ncclFloat32, ncclSum, ctx.stream());
+#else
+            // Fallback: no-op for single device or when NCCL is not available
+            (void)dst_elements; // Suppress unused variable warning
+#endif
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         }
 
-        if (active_devices > 1) {
-            fprintf(stderr, "NCCL: Would perform all-reduce across %d devices (temporarily disabled)\n", active_devices);
-            // TODO: Fix NCCL all-reduce implementation
-            // For now, manually sum the partial results on host
-            std::vector<float> host_sum(ggml_nelements(dst), 0.0f);
-
-            for (int id = 0; id < ndev; ++id) {
-                if (dst_partial[id] == nullptr) continue;
-
+        // Copy final result from any device to dst (all devices have the same result after all-reduce)
+        for (int id = 0; id < ndev; ++id) {
+            if (dst_partial[id] != nullptr) {
                 ggml_cuda_set_device(id);
-                std::vector<float> device_partial(ggml_nelements(dst));
-                CUDA_CHECK(cudaMemcpy(device_partial.data(), dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
-
-                // Add to sum
-                for (size_t i = 0; i < host_sum.size(); ++i) {
-                    host_sum[i] += device_partial[i];
-                }
-            }
-
-            // Copy summed result to dst
-            memcpy(dst->data, host_sum.data(), dst_partial_size);
-        } else {
-            fprintf(stderr, "NCCL: Only %d active device(s), skipping all-reduce\n", active_devices);
-
-            // Find the first valid device and copy its result
-            for (int id = 0; id < ndev; ++id) {
-                if (dst_partial[id] != nullptr) {
-                    ggml_cuda_set_device(id);
-                    CUDA_CHECK(cudaMemcpy(dst->data, dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
-                    break;
-                }
+                CUDA_CHECK(cudaMemcpy(dst->data, dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
+                break;
             }
         }
     } else {
-        // Fallback: copy partials to host and sum manually
-        std::vector<float> host_partial(ggml_nelements(dst), 0.0f);
+        // Single device case: just copy the result
         for (int id = 0; id < ndev; ++id) {
-            if (dst_partial[id] == nullptr) continue;
-            std::vector<float> device_partial(ggml_nelements(dst));
-            ggml_cuda_set_device(id);
-            CUDA_CHECK(cudaMemcpy(device_partial.data(), dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
-            for (size_t i = 0; i < host_partial.size(); ++i) {
-                host_partial[i] += device_partial[i];
+            if (dst_partial[id] != nullptr) {
+                ggml_cuda_set_device(id);
+                CUDA_CHECK(cudaMemcpy(dst->data, dst_partial[id], dst_partial_size, cudaMemcpyDeviceToHost));
+                break;
             }
         }
-        memcpy(dst->data, host_partial.data(), dst_partial_size);
     }
 
     // Cleanup
@@ -4480,6 +4487,7 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 NCCLCHECK(ncclCommInitAll(&g_nccl_comm, actual_ndev, devs.data()));
                 fprintf(stderr, "NCCL: Communicator initialized successfully\n");
                 g_nccl_initialized = true;
+                g_nccl_size = actual_ndev;
             } else {
                 fprintf(stderr, "NCCL: Only %d device(s) available, skipping NCCL initialization\n", actual_ndev);
             }
