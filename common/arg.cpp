@@ -2470,6 +2470,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"--tp-n"}, "N",
+        "number of GPUs for tensor parallelism (default: 1)",
+        [](common_params & params, int value) {
+            params.tp_n = value;
+        }
+    ).set_env("LLAMA_ARG_TP_N"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {

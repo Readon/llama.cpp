@@ -48,6 +48,11 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+#ifdef GGML_CUDA_USE_NCCL
+struct ggml_cuda_nccl_context;
+void ggml_cuda_nccl_init_comms(void * ctx, int n_gpu_groups, int tp_n);
+#endif
+
 #ifdef  __cplusplus
 }
 #endif

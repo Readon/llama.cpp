@@ -148,6 +148,48 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
 
+// Helper function to determine the tensor parallelism strategy for a given tensor.
+enum tensor_parallel_strategy {
+    TP_STRATEGY_COLUMN,
+    TP_STRATEGY_ROW,
+    TP_STRATEGY_REPLICATE,
+    TP_STRATEGY_AUTO
+};
+
+static tensor_parallel_strategy get_tensor_parallel_strategy(const ggml_tensor * tensor, int split_mode_hint) {
+    if (!tensor->name) {
+        return TP_STRATEGY_AUTO;
+    }
+
+    std::string name(tensor->name);
+
+    if (name.find(".attn_output.weight") != std::string::npos ||
+        name.find(".ffn_down.weight") != std::string::npos) {
+        return TP_STRATEGY_ROW;
+    }
+
+    if (name.find(".attn_q.weight") != std::string::npos ||
+        name.find(".attn_k.weight") != std::string::npos ||
+        name.find(".attn_v.weight") != std::string::npos ||
+        name.find(".ffn_gate.weight") != std::string::npos ||
+        name.find(".ffn_up.weight") != std::string::npos) {
+        return TP_STRATEGY_COLUMN;
+    }
+
+    if (name.find("token_embd.weight") != std::string::npos ||
+        name.find("output.weight") != std::string::npos) {
+        return (split_mode_hint == 1) ? TP_STRATEGY_COLUMN : TP_STRATEGY_ROW;
+    }
+
+    if (name.find("bias") != std::string::npos ||
+        name.find("norm") != std::string::npos ||
+        ggml_nelements(tensor) < 1024) {
+        return TP_STRATEGY_REPLICATE;
+    }
+
+    return TP_STRATEGY_AUTO;
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -289,8 +331,22 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
+static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list, const buft_list_t * buft_list_col) {
     GGML_ASSERT(!buft_list.empty());
+
+    if (buft_list_col) {
+        tensor_parallel_strategy strategy = get_tensor_parallel_strategy(tensor, 0); // default to row
+        if (strategy == TP_STRATEGY_COLUMN) {
+            for (const auto & cur : *buft_list_col) {
+                ggml_backend_dev_t cur_dev = cur.first;
+                ggml_backend_buffer_type_t cur_buft = cur.second;
+                if (weight_buft_supported(hparams, tensor, op, cur_buft, cur_dev)) {
+                    return cur_buft;
+                }
+            }
+        }
+    }
+
     for (const auto & cur : buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
         ggml_backend_buffer_type_t cur_buft = cur.second;
@@ -486,6 +542,8 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+    std::vector<buft_list_t> gpu_buft_list_groups;
+    std::vector<buft_list_t> gpu_buft_list_groups_col;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -1973,11 +2031,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts);
-    for (auto * dev : devices) {
-        buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
-        // add CPU buffer types as a fallback
-        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
-        pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
+    if (params.tp_n > 1) {
+        const int n_gpu_groups = devices.size() / params.tp_n;
+        pimpl->gpu_buft_list_groups.resize(n_gpu_groups);
+        pimpl->gpu_buft_list_groups_col.resize(n_gpu_groups);
+
+        for (int i = 0; i < n_gpu_groups; ++i) {
+            ggml_backend_dev_t main_dev = devices[i * params.tp_n];
+
+            // Create a uniform tensor split for the group
+            std::vector<float> group_split(params.tp_n);
+            for (int j = 0; j < params.tp_n; ++j) {
+                group_split[j] = 1.0f / params.tp_n;
+            }
+
+            // Create buffer list for the group (row-wise)
+            buft_list_t buft_list_row = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_ROW, group_split.data());
+            buft_list_row.insert(buft_list_row.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+            pimpl->gpu_buft_list_groups[i] = std::move(buft_list_row);
+
+            // Create buffer list for the group (col-wise)
+            buft_list_t buft_list_col = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_COL, group_split.data());
+            buft_list_col.insert(buft_list_col.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+            pimpl->gpu_buft_list_groups_col[i] = std::move(buft_list_col);
+        }
+    } else {
+        for (auto * dev : devices) {
+            buft_list_t buft_list = make_gpu_buft_list(dev, split_mode, tensor_split);
+            // add CPU buffer types as a fallback
+            buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+            pimpl->gpu_buft_list.emplace(dev, std::move(buft_list));
+        }
     }
 
     // calculate the split points
@@ -2012,16 +2096,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
     const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, (int)n_layer + 1);
-    auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+    auto get_layer_buft_list = [&](int il) -> std::pair<llama_model::impl::layer_dev, buft_list_t *> {
         const bool is_swa = il < (int) hparams.n_layer && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
-            return {cpu_dev, &pimpl->cpu_buft_list};
+            return {{cpu_dev, &pimpl->cpu_buft_list}, nullptr};
         }
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
-        auto * dev = devices.at(layer_gpu);
-        LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
-        return {dev, &pimpl->gpu_buft_list.at(dev)};
+
+        if (params.tp_n > 1) {
+            const int n_gpu_groups = devices.size() / params.tp_n;
+            const int layer_gpu_group = std::upper_bound(splits.begin(), splits.begin() + n_gpu_groups, float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+            auto * main_dev = devices.at(layer_gpu_group * params.tp_n);
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to gpu group %d, is_swa = %d\n", il, layer_gpu_group, is_swa);
+            return {{main_dev, &pimpl->gpu_buft_list_groups.at(layer_gpu_group)}, &pimpl->gpu_buft_list_groups_col.at(layer_gpu_group)};
+        } else {
+            const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+            auto * dev = devices.at(layer_gpu);
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {{dev, &pimpl->gpu_buft_list.at(dev)}, nullptr};
+        }
     };
 
     // assign the input layer
@@ -2159,16 +2252,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             // select the buffer type for this tensor
-            buft_list_t * buft_list;
+            buft_list_t * buft_list_row;
+            buft_list_t * buft_list_col;
             switch (info.layer) {
                 case LLM_TENSOR_LAYER_INPUT:
-                    buft_list = pimpl->dev_input.buft_list;
+                    buft_list_row = pimpl->dev_input.buft_list;
+                    buft_list_col = nullptr;
                     break;
                 case LLM_TENSOR_LAYER_OUTPUT:
-                    buft_list = pimpl->dev_output.buft_list;
+                    {
+                        auto res = get_layer_buft_list(hparams.n_layer);
+                        buft_list_row = res.first.buft_list;
+                        buft_list_col = res.second;
+                    }
                     break;
                 case LLM_TENSOR_LAYER_REPEATING:
-                    buft_list = pimpl->dev_layer.at(tn.bid).buft_list;
+                    {
+                        auto res = get_layer_buft_list(tn.bid);
+                        buft_list_row = res.first.buft_list;
+                        buft_list_col = res.second;
+                    }
                     break;
                 default:
                     GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
@@ -2184,7 +2287,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     if (std::regex_search(tensor_name, pattern)) {
                         if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                             // when overriding to a CPU buffer, consider the extra buffer types
-                            buft = select_weight_buft(hparams, t_meta, op, pimpl->cpu_buft_list);
+                            buft = select_weight_buft(hparams, t_meta, op, pimpl->cpu_buft_list, nullptr);
                         } else {
                             buft = overrides->buft;
                         }
@@ -2199,7 +2302,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             }
 
             if (!buft) {
-                buft = select_weight_buft(hparams, t_meta, op, *buft_list);
+                buft = select_weight_buft(hparams, t_meta, op, *buft_list_row, buft_list_col);
                 if (!buft) {
                     throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
                 }

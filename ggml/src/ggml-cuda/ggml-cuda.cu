@@ -53,9 +53,6 @@
 #ifdef GGML_CUDA_USE_NCCL
 #include <nccl.h>
 
-static ncclComm_t g_nccl_comm = nullptr;
-static bool g_nccl_initialized = false;
-static int g_nccl_size = 1;
 
 #define NCCLCHECK(cmd) do {                         \
   ncclResult_t r = cmd;                             \
@@ -67,21 +64,21 @@ static int g_nccl_size = 1;
 } while(0)
 
 // NCCL collective operations wrapper
-static void nccl_all_reduce(void* data, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
-    if (!g_nccl_initialized || g_nccl_size <= 1) {
+static void nccl_all_reduce(ncclComm_t comm, void* data, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
+    if (comm == nullptr) {
         return; // No-op for single GPU
     }
-    NCCLCHECK(ncclAllReduce(data, data, count, datatype, op, g_nccl_comm, stream));
+    NCCLCHECK(ncclAllReduce(data, data, count, datatype, op, comm, stream));
 }
 
-static void nccl_all_gather(const void* sendbuf, void* recvbuf, size_t sendcount, ncclDataType_t datatype, cudaStream_t stream) {
-    if (!g_nccl_initialized || g_nccl_size <= 1) {
+static void nccl_all_gather(ncclComm_t comm, const void* sendbuf, void* recvbuf, size_t sendcount, ncclDataType_t datatype, cudaStream_t stream) {
+    if (comm == nullptr) {
         if (sendbuf != recvbuf) {
             CUDA_CHECK(cudaMemcpyAsync(recvbuf, sendbuf, sendcount * sizeof(float), cudaMemcpyDeviceToDevice, stream));
         }
         return;
     }
-    NCCLCHECK(ncclAllGather(sendbuf, recvbuf, sendcount, datatype, g_nccl_comm, stream));
+    NCCLCHECK(ncclAllGather(sendbuf, recvbuf, sendcount, datatype, comm, stream));
 }
 #endif
 #include "ggml.h"
