@@ -61,6 +61,24 @@
     }                                                                                       \
 } while(0)
 
+size_t ncclDataTypeSize(ncclDataType_t datatype) {
+    switch (datatype) {
+        case ncclInt8:   return sizeof(int8_t);
+        case ncclUint8:  return sizeof(uint8_t);
+        case ncclInt32:  return sizeof(int32_t);
+        case ncclUint32: return sizeof(uint32_t);
+        case ncclInt64:  return sizeof(int64_t);
+        case ncclUint64: return sizeof(uint64_t);
+        case ncclFloat16:return sizeof(half);
+        case ncclFloat32:return sizeof(float);
+        case ncclFloat64:return sizeof(double);
+#if NCCL_VERSION_CODE >= 21000
+        case ncclBfloat16: return sizeof(uint16_t);
+#endif
+        default: return 0;
+    }
+}
+
 // NCCL collective operations wrapper
 static void nccl_all_reduce(ncclComm_t comm, void * sendbuff, void * recvbuff, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
     if (comm == nullptr) {
@@ -81,24 +99,6 @@ static void nccl_all_gather(ncclComm_t comm, const void * sendbuff, void * recvb
         return;
     }
     NCCLCHECK(ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comm, stream));
-}
-
-size_t ncclDataTypeSize(ncclDataType_t datatype) {
-    switch (datatype) {
-        case ncclInt8:   return sizeof(int8_t);
-        case ncclUint8:  return sizeof(uint8_t);
-        case ncclInt32:  return sizeof(int32_t);
-        case ncclUint32: return sizeof(uint32_t);
-        case ncclInt64:  return sizeof(int64_t);
-        case ncclUint64: return sizeof(uint64_t);
-        case ncclFloat16:return sizeof(half);
-        case ncclFloat32:return sizeof(float);
-        case ncclFloat64:return sizeof(double);
-#if NCCL_VERSION_CODE >= 21000
-        case ncclBfloat16: return sizeof(uint16_t);
-#endif
-        default: return 0;
-    }
 }
 #endif
 #include "ggml.h"
