@@ -2318,11 +2318,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
 
-            if (buft != buft_list->front().second) {
+            if (buft != buft_list_row->front().second) {
                 n_moved_tensors++;
                 if (!first_moved_tensor) {
                     first_moved_tensor = t_meta;
-                    first_moved_from_buft = buft_list->front().second;
+                    first_moved_from_buft = buft_list_row->front().second;
                     first_moved_to_buft   = buft;
                 }
             }
@@ -18691,6 +18691,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.tp_n                        =*/ 1,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

@@ -53,32 +53,52 @@
 #ifdef GGML_CUDA_USE_NCCL
 #include <nccl.h>
 
-
-#define NCCLCHECK(cmd) do {                         \
-  ncclResult_t r = cmd;                             \
-  if (r!= ncclSuccess) {                            \
-    printf("Failed, NCCL error %s:%d '%s'\n",      \
-        __FILE__,__LINE__,ncclGetErrorString(r));   \
-    exit(EXIT_FAILURE);                             \
-  }                                                 \
+#define NCCLCHECK(cmd) do {                                                                 \
+    ncclResult_t r = cmd;                                                                   \
+    if (r!= ncclSuccess) {                                                                  \
+        fprintf(stderr, "Failed, NCCL error %s:%d '%s'\n", __FILE__,__LINE__, ncclGetErrorString(r)); \
+        exit(EXIT_FAILURE);                                                                 \
+    }                                                                                       \
 } while(0)
 
 // NCCL collective operations wrapper
-static void nccl_all_reduce(ncclComm_t comm, void* data, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
+static void nccl_all_reduce(ncclComm_t comm, void * sendbuff, void * recvbuff, size_t count, ncclDataType_t datatype, ncclRedOp_t op, cudaStream_t stream) {
     if (comm == nullptr) {
-        return; // No-op for single GPU
-    }
-    NCCLCHECK(ncclAllReduce(data, data, count, datatype, op, comm, stream));
-}
-
-static void nccl_all_gather(ncclComm_t comm, const void* sendbuf, void* recvbuf, size_t sendcount, ncclDataType_t datatype, cudaStream_t stream) {
-    if (comm == nullptr) {
-        if (sendbuf != recvbuf) {
-            CUDA_CHECK(cudaMemcpyAsync(recvbuf, sendbuf, sendcount * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        // No-op for single GPU, but still need to copy data if sendbuff != recvbuff
+        if (sendbuff != recvbuff) {
+            CUDA_CHECK(cudaMemcpyAsync(recvbuff, sendbuff, count * ncclDataTypeSize(datatype), cudaMemcpyDeviceToDevice, stream));
         }
         return;
     }
-    NCCLCHECK(ncclAllGather(sendbuf, recvbuf, sendcount, datatype, comm, stream));
+    NCCLCHECK(ncclAllReduce(sendbuff, recvbuff, count, datatype, op, comm, stream));
+}
+
+static void nccl_all_gather(ncclComm_t comm, const void * sendbuff, void * recvbuff, size_t sendcount, ncclDataType_t datatype, cudaStream_t stream) {
+    if (comm == nullptr) {
+        if (sendbuff != recvbuff) {
+            CUDA_CHECK(cudaMemcpyAsync(recvbuff, sendbuff, sendcount * ncclDataTypeSize(datatype), cudaMemcpyDeviceToDevice, stream));
+        }
+        return;
+    }
+    NCCLCHECK(ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comm, stream));
+}
+
+size_t ncclDataTypeSize(ncclDataType_t datatype) {
+    switch (datatype) {
+        case ncclInt8:   return sizeof(int8_t);
+        case ncclUint8:  return sizeof(uint8_t);
+        case ncclInt32:  return sizeof(int32_t);
+        case ncclUint32: return sizeof(uint32_t);
+        case ncclInt64:  return sizeof(int64_t);
+        case ncclUint64: return sizeof(uint64_t);
+        case ncclFloat16:return sizeof(half);
+        case ncclFloat32:return sizeof(float);
+        case ncclFloat64:return sizeof(double);
+#if NCCL_VERSION_CODE >= 21000
+        case ncclBfloat16: return sizeof(uint16_t);
+#endif
+        default: return 0;
+    }
 }
 #endif
 #include "ggml.h"
@@ -957,6 +977,9 @@ struct ggml_backend_cuda_split_buffer_type_context {
     std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
     std::string name;
     int axis; // 0=row, 1=col
+#ifdef GGML_CUDA_USE_NCCL
+    ncclComm_t nccl_comm;
+#endif
 };
 
 struct ggml_backend_cuda_split_buffer_context {
@@ -2367,8 +2390,9 @@ static void ggml_cuda_mul_mat_row_tp(ggml_backend_cuda_context & ctx, const ggml
         // Use NCCL all-gather to collect all partial results
         const size_t local_result_elements = nrows_split * ne11;
 #ifdef GGML_CUDA_USE_NCCL
+        ncclComm_t nccl_comm = buft_ctx->nccl_comm;
         // All-gather: each device contributes its local result to form the complete output
-        nccl_all_gather(dst_d, dst_full, local_result_elements, ncclFloat32, ctx.stream());
+        nccl_all_gather(nccl_comm, dst_d, dst_full, local_result_elements, ncclFloat32, ctx.stream());
 
         // Synchronize after all-gather
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
@@ -2518,7 +2542,8 @@ static void ggml_cuda_mul_mat_col_tp(ggml_backend_cuda_context & ctx, const ggml
 
             // Use NCCL all-reduce to sum partial results across all devices
 #ifdef GGML_CUDA_USE_NCCL
-            nccl_all_reduce(dst_partial[id], dst_elements, ncclFloat32, ncclSum, ctx.stream());
+            ncclComm_t nccl_comm = buft_ctx->nccl_comm;
+            nccl_all_reduce(nccl_comm, dst_partial[id], dst_partial[id], dst_elements, ncclFloat32, ncclSum, ctx.stream());
 #else
             // Fallback: no-op for single device or when NCCL is not available
             (void)dst_elements; // Suppress unused variable warning
@@ -4334,6 +4359,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int main_devic
     ggml_backend_cuda_split_buffer_type_context * ctx = new ggml_backend_cuda_split_buffer_type_context;
     ctx->main_device = main_device;
     ctx->axis = axis;
+#ifdef GGML_CUDA_USE_NCCL
+    ctx->nccl_comm = nullptr;
+#endif
 
     // Initialize tensor_split array properly
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
@@ -4371,8 +4399,24 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int main_devic
     auto key = std::make_tuple(main_device, tensor_split_arr, axis);
     auto it = buft_map.find(key);
     if (it != buft_map.end()) {
+        delete ctx; // not needed
         return &it->second;
     }
+
+#ifdef GGML_CUDA_USE_NCCL
+    const int ndev = ggml_backend_cuda_get_device_count();
+    if (ndev > 1) {
+        std::vector<int> devs;
+        for (int i = 0; i < ndev; i++) {
+            if (tensor_split_arr[i] < (i + 1 < ndev ? tensor_split_arr[i+1] : 1.0f)) {
+                devs.push_back(i);
+            }
+        }
+        if (devs.size() > 1) {
+            NCCLCHECK(ncclCommInitAll(&ctx->nccl_comm, devs.size(), devs.data()));
+        }
+    }
+#endif
 
     struct ggml_backend_buffer_type buft {
         /* .iface   = */ ggml_backend_cuda_split_buffer_type_interface,
@@ -4447,52 +4491,6 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
             };
         }
 
-#ifdef GGML_CUDA_USE_NCCL
-    if (!g_nccl_initialized) {
-        const int ndev = ggml_backend_cuda_get_device_count();
-        if (ndev > 1) {
-            // Check if CUDA_VISIBLE_DEVICES is set and limits the visible devices
-            const char* visible_devices = getenv("CUDA_VISIBLE_DEVICES");
-            int actual_ndev = ndev;
-
-            if (visible_devices) {
-                // Count actual visible devices
-                std::string devices_str(visible_devices);
-                actual_ndev = 1; // At least one device
-                for (char c : devices_str) {
-                    if (c == ',') actual_ndev++;
-                }
-                actual_ndev = std::min(actual_ndev, ndev);
-                fprintf(stderr, "NCCL: Using %d devices (CUDA_VISIBLE_DEVICES=%s)\n", actual_ndev, visible_devices);
-            }
-
-            if (actual_ndev > 1) {
-                std::vector<int> devs(actual_ndev);
-                for (int i = 0; i < actual_ndev; ++i) devs[i] = i;
-
-                ncclUniqueId id;
-                int current_device;
-                CUDA_CHECK(cudaGetDevice(&current_device));
-
-                // Generate unique ID on device 0
-                if (current_device == 0) {
-                    NCCLCHECK(ncclGetUniqueId(&id));
-                }
-
-                // Initialize NCCL communicator for single-process multi-GPU
-                fprintf(stderr, "NCCL: Initializing communicator for %d devices...\n", actual_ndev);
-                NCCLCHECK(ncclCommInitAll(&g_nccl_comm, actual_ndev, devs.data()));
-                fprintf(stderr, "NCCL: Communicator initialized successfully\n");
-                g_nccl_initialized = true;
-                g_nccl_size = actual_ndev;
-            } else {
-                fprintf(stderr, "NCCL: Only %d device(s) available, skipping NCCL initialization\n", actual_ndev);
-            }
-        } else {
-            fprintf(stderr, "NCCL: Only 1 device available, skipping NCCL initialization\n");
-        }
-    }
-#endif
 
         initialized = true;
     }

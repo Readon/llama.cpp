@@ -200,7 +200,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     if (params.tp_n > 1) {
         int n_gpu_groups = 0;
         if (params.tensor_split != nullptr) {
-            for (int i = 0; i < llama_max_devices(); ++i) {
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (params.tensor_split[i] > 0.0f) {
                     n_gpu_groups++;
                 }
