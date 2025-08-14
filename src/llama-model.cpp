@@ -157,7 +157,7 @@ enum tensor_parallel_strategy {
 };
 
 static tensor_parallel_strategy get_tensor_parallel_strategy(const ggml_tensor * tensor, int split_mode_hint) {
-    if (!tensor->name) {
+    if (tensor->name[0] == '\0') {
         return TP_STRATEGY_AUTO;
     }
 
