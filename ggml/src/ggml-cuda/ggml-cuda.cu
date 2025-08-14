@@ -61,7 +61,7 @@
     }                                                                                       \
 } while(0)
 
-size_t ncclDataTypeSize(ncclDataType_t datatype) {
+static size_t ncclDataTypeSize(ncclDataType_t datatype) {
     switch (datatype) {
         case ncclInt8:   return sizeof(int8_t);
         case ncclUint8:  return sizeof(uint8_t);
@@ -837,7 +837,7 @@ enum tensor_parallel_strategy {
 
 // Identify optimal tensor parallelism strategy
 static tensor_parallel_strategy get_tensor_parallel_strategy(const ggml_tensor * tensor, int split_mode_hint) {
-    if (!tensor->name) {
+    if (tensor->name[0] == '\0') {
         return TP_STRATEGY_AUTO;
     }
 
@@ -882,7 +882,7 @@ static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tens
     // For Q/K/V weights, split by attention heads for optimal performance
     if (strategy == TP_STRATEGY_COLUMN) {
         // Check if this is attention Q/K/V weights that need head-aligned splitting
-        std::string name = tensor->name ? std::string(tensor->name) : "";
+        std::string name = tensor->name[0] != '\0' ? std::string(tensor->name) : "";
         int64_t rounding = 32; // Default rounding for quantized types
 
         if (name.find(".attn_q.weight") != std::string::npos ||
@@ -910,7 +910,7 @@ static void get_col_split(int64_t * col_low, int64_t * col_high, const ggml_tens
         // Issue a warning and fall back to regular column split
         if (strategy == TP_STRATEGY_ROW) {
             fprintf(stderr, "WARNING: %s should use row-wise splitting for optimal tensor parallelism\n",
-                    tensor->name ? tensor->name : "unnamed_tensor");
+                    tensor->name[0] != '\0' ? tensor->name : "unnamed_tensor");
         }
 
         // Regular column split
@@ -946,7 +946,7 @@ static void get_row_split(int64_t * row_low, int64_t * row_high, const ggml_tens
     } else if (strategy == TP_STRATEGY_COLUMN) {
         // This tensor should use column-wise TP but is in row mode
         fprintf(stderr, "INFO: %s would benefit from column-wise splitting\n",
-                tensor->name ? tensor->name : "unnamed_tensor");
+                tensor->name[0] != '\0' ? tensor->name : "unnamed_tensor");
     }
 
     *row_low = id == 0 ? 0 : nrows*tensor_split[id];
@@ -1378,6 +1378,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(int main_device, 
         tensor_split_arr,
         GGML_CUDA_NAME + std::to_string(main_device) + "_Split",
         0, // axis = row
+#ifdef GGML_CUDA_USE_NCCL
+        nullptr,
+#endif
     };
 
     struct ggml_backend_buffer_type buft {
@@ -2628,7 +2631,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             if (strategy == TP_STRATEGY_ROW) {
                 // This tensor should use row-wise TP but is in column mode
                 fprintf(stderr, "WARNING: %s should use row-wise splitting but is in column mode. Consider using row split for better performance.\n",
-                        src0->name ? src0->name : "unnamed_tensor");
+                        src0->name[0] != '\0' ? src0->name : "unnamed_tensor");
             }
             // Column-wise TP: compute partial results and all-reduce
             ggml_cuda_mul_mat_col_tp(ctx, src0, src1, dst);
@@ -2642,7 +2645,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             } else if (strategy == TP_STRATEGY_COLUMN) {
                 // This tensor should use column-wise TP but is in row mode
                 fprintf(stderr, "WARNING: %s should use column-wise splitting but is in row mode. Consider using column split for better performance.\n",
-                        src0->name ? src0->name : "unnamed_tensor");
+                        src0->name[0] != '\0' ? src0->name : "unnamed_tensor");
             }
         }
 
