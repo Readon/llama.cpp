@@ -544,6 +544,7 @@ struct llama_model::impl {
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
     std::vector<buft_list_t> gpu_buft_list_groups;
     std::vector<buft_list_t> gpu_buft_list_groups_col;
+    std::vector<std::vector<float>> gpu_group_splits;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -2035,23 +2036,21 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         const int n_gpu_groups = devices.size() / params.tp_n;
         pimpl->gpu_buft_list_groups.resize(n_gpu_groups);
         pimpl->gpu_buft_list_groups_col.resize(n_gpu_groups);
+        pimpl->gpu_group_splits.resize(n_gpu_groups);
 
         for (int i = 0; i < n_gpu_groups; ++i) {
             ggml_backend_dev_t main_dev = devices[i * params.tp_n];
 
             // Create a uniform tensor split for the group
-            std::vector<float> group_split(params.tp_n);
-            for (int j = 0; j < params.tp_n; ++j) {
-                group_split[j] = 1.0f / params.tp_n;
-            }
+            pimpl->gpu_group_splits[i].assign(params.tp_n, 1.0f / params.tp_n);
 
             // Create buffer list for the group (row-wise)
-            buft_list_t buft_list_row = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_ROW, group_split.data());
+            buft_list_t buft_list_row = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_ROW, pimpl->gpu_group_splits[i].data());
             buft_list_row.insert(buft_list_row.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
             pimpl->gpu_buft_list_groups[i] = std::move(buft_list_row);
 
             // Create buffer list for the group (col-wise)
-            buft_list_t buft_list_col = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_COL, group_split.data());
+            buft_list_t buft_list_col = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_COL, pimpl->gpu_group_splits[i].data());
             buft_list_col.insert(buft_list_col.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
             pimpl->gpu_buft_list_groups_col[i] = std::move(buft_list_col);
         }
@@ -2096,16 +2095,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // sum and normalize the splits to get the split points
-    float split_sum = 0.0f;
-    for (float split : splits) {
-        split_sum += split;
-    }
-    float current_split = 0.0f;
-    for (float & split : splits) {
-        current_split += split;
-        split = current_split / split_sum;
-    }
     if (!splits.empty()) {
+        float split_sum = 0.0f;
+        for (float split : splits) {
+            split_sum += split;
+        }
+
+        if (split_sum == 0.0f) {
+            LLAMA_LOG_WARN("%s: no free memory available on any GPU, falling back to uniform split\n", __func__);
+            for (size_t i = 0; i < splits.size(); ++i) {
+                splits[i] = 1.0f;
+            }
+            split_sum = (float) splits.size();
+        }
+
+        float current_split = 0.0f;
+        for (float & split : splits) {
+            current_split += split;
+            split = current_split / split_sum;
+        }
         splits.back() = 1.0f;
     }
 
