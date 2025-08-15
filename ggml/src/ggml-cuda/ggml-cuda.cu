@@ -972,15 +972,6 @@ static size_t ggml_nbytes_split_col(const struct ggml_tensor * tensor, int ncols
     return ggml_nrows(tensor)*ggml_row_size(tensor->type, ncols_split);
 }
 
-struct ggml_backend_cuda_split_buffer_type_context {
-    int main_device;
-    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
-    std::string name;
-    int axis; // 0=row, 1=col
-#ifdef GGML_CUDA_USE_NCCL
-    ncclComm_t nccl_comm;
-#endif
-};
 
 struct ggml_backend_cuda_split_buffer_context {
     ~ggml_backend_cuda_split_buffer_context() {
