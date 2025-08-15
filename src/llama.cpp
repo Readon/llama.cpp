@@ -206,9 +206,15 @@ static struct llama_model * llama_model_load_from_file_impl(
                 }
             }
         }
-        // if tensor_split is not given, we assume 1 group
+
         if (n_gpu_groups == 0) {
-            n_gpu_groups = 1;
+            if (model->devices.size() % params.tp_n != 0) {
+                LLAMA_LOG_ERROR("%s: number of GPUs must be a multiple of tp_n=%d (have %zu)\n",
+                    __func__, params.tp_n, model->devices.size());
+                llama_model_free(model);
+                return nullptr;
+            }
+            n_gpu_groups = model->devices.size() / params.tp_n;
         }
 
         const int n_gpus_required = n_gpu_groups * params.tp_n;
