@@ -21,7 +21,7 @@ function(llama_build_cuda_test source)
         endif()
 
         add_executable(${TEST_TARGET} ${source})
-        target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+        target_link_libraries(${TEST_TARGET} PRIVATE ggml ggml-cuda)
         install(TARGETS ${TEST_TARGET} RUNTIME)
     endif()
 endfunction()

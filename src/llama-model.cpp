@@ -157,7 +157,7 @@ enum tensor_parallel_strategy {
 };
 
 static tensor_parallel_strategy get_tensor_parallel_strategy(const ggml_tensor * tensor, int split_mode_hint) {
-    if (!tensor->name) {
+    if (tensor->name[0] == '\0') {
         return TP_STRATEGY_AUTO;
     }
 
@@ -2124,11 +2124,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        pimpl->dev_layer[il] = get_layer_buft_list(il);
+        pimpl->dev_layer[il] = get_layer_buft_list(il).first;
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer);
+    pimpl->dev_output = get_layer_buft_list(n_layer).first;
 
     // one ggml context per buffer type
     int max_n_tensors = ml.n_tensors;
@@ -2318,11 +2318,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 buft = ggml_backend_dev_buffer_type(cpu_dev);
             }
 
-            if (buft != buft_list->front().second) {
+            if (buft != buft_list_row->front().second) {
                 n_moved_tensors++;
                 if (!first_moved_tensor) {
                     first_moved_tensor = t_meta;
-                    first_moved_from_buft = buft_list->front().second;
+                    first_moved_from_buft = buft_list_row->front().second;
                     first_moved_to_buft   = buft;
                 }
             }
@@ -18691,6 +18691,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.tp_n                        =*/ 1,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
