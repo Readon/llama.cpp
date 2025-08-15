@@ -2065,30 +2065,47 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // calculate the split points
-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
-    std::vector<float> splits(n_devices());
-    if (all_zero) {
-        // default split, by free memory
-        for (size_t i = 0; i < n_devices(); ++i) {
-            ggml_backend_dev_t dev = devices[i];
-            size_t total;
-            size_t free;
-            ggml_backend_dev_memory(dev, &free, &total);
-            splits[i] = free;
+    std::vector<float> splits;
+    if (params.tp_n > 1) {
+        const int n_gpu_groups = devices.size() / params.tp_n;
+        splits.resize(n_gpu_groups);
+        bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_gpu_groups, [](float x) { return x == 0.0f; });
+        if (all_zero) {
+            // default split, uniform
+            for (int i = 0; i < n_gpu_groups; ++i) {
+                splits[i] = 1.0f;
+            }
+        } else {
+            std::copy(tensor_split, tensor_split + n_gpu_groups, splits.begin());
         }
     } else {
-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        splits.resize(n_devices());
+        bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+        if (all_zero) {
+            // default split, by free memory
+            for (size_t i = 0; i < n_devices(); ++i) {
+                ggml_backend_dev_t dev = devices[i];
+                size_t total;
+                size_t free;
+                ggml_backend_dev_memory(dev, &free, &total);
+                splits[i] = free;
+            }
+        } else {
+            std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+        }
     }
 
     // sum and normalize the splits to get the split points
     float split_sum = 0.0f;
-    for (size_t i = 0; i < n_devices(); ++i) {
-        split_sum += splits[i];
-        splits[i] = split_sum;
+    for (float split : splits) {
+        split_sum += split;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    float current_split = 0.0f;
+    for (float & split : splits) {
+        current_split += split;
+        split = current_split / split_sum;
     }
+    splits.back() = 1.0f;
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
