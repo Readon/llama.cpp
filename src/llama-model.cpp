@@ -2105,7 +2105,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         current_split += split;
         split = current_split / split_sum;
     }
-    splits.back() = 1.0f;
+    if (!splits.empty()) {
+        splits.back() = 1.0f;
+    }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
