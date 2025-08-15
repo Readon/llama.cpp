@@ -56,3 +56,21 @@ void ggml_cuda_nccl_init_comms(void * ctx, int n_gpu_groups, int tp_n);
 #ifdef  __cplusplus
 }
 #endif
+
+#if defined(__cplusplus)
+#include <array>
+#include <string>
+#ifdef GGML_CUDA_USE_NCCL
+#include "nccl.h"
+#endif
+
+struct ggml_backend_cuda_split_buffer_type_context {
+    int main_device;
+    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
+    std::string name;
+    int axis; // 0=row, 1=col
+#ifdef GGML_CUDA_USE_NCCL
+    ncclComm_t nccl_comm;
+#endif
+};
+#endif
