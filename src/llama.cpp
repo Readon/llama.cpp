@@ -212,6 +212,26 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
 
+    // validate tensor parallelism configuration
+    if (params.gpus_tp > 1) {
+        if (model->devices.empty()) {
+            LLAMA_LOG_ERROR("%s: tensor parallelism requires at least one GPU device\n", __func__);
+            llama_model_free(model);
+            return nullptr;
+        }
+
+        // check if we have enough devices for tensor parallelism
+        if ((int)model->devices.size() % params.gpus_tp != 0) {
+            LLAMA_LOG_ERROR("%s: number of available GPUs (%zu) must be divisible by gpus_tp (%d)\n",
+                __func__, model->devices.size(), params.gpus_tp);
+            llama_model_free(model);
+            return nullptr;
+        }
+
+        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs per group, %zu total groups\n",
+            __func__, params.gpus_tp, model->devices.size() / params.gpus_tp);
+    }
+
     for (auto * dev : model->devices) {
         size_t free, total; // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);

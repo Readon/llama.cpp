@@ -14,6 +14,14 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+
+// Forward declarations for tensor parallelism functions
+#ifdef GGML_USE_CUDA
+extern "C" {
+bool ggml_cuda_tp_init(int tp_size, const int* device_ids, int num_devices);
+void ggml_cuda_tp_cleanup();
+}
+#endif
 #include <cassert>
 #include <cmath>
 #include <cfloat>
@@ -1898,6 +1906,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & n_gpu_layers = params.n_gpu_layers;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
+    const auto & gpus_tp      = params.gpus_tp;
 
     const int n_layer = hparams.n_layer;
 
@@ -1938,6 +1947,41 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
+    }
+
+    // initialize tensor parallelism if enabled
+    if (gpus_tp > 1) {
+        if (devices.empty()) {
+            LLAMA_LOG_ERROR("%s: tensor parallelism requires at least one GPU device\n", __func__);
+            return false;
+        }
+
+        // check if we have enough devices for tensor parallelism
+        if ((int)devices.size() % gpus_tp != 0) {
+            LLAMA_LOG_ERROR("%s: number of available GPUs (%zu) must be divisible by gpus_tp (%d)\n",
+                __func__, devices.size(), gpus_tp);
+            return false;
+        }
+
+#ifdef GGML_USE_CUDA
+        // initialize tensor parallelism with device IDs
+        std::vector<int> device_ids;
+        for (size_t i = 0; i < devices.size(); i++) {
+            // Extract device ID from device (this is a simplified approach)
+            device_ids.push_back(static_cast<int>(i));
+        }
+
+        if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
+            LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
+            return false;
+        }
+
+        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs per group, %zu total groups\n",
+            __func__, gpus_tp, devices.size() / gpus_tp);
+#else
+        LLAMA_LOG_ERROR("%s: tensor parallelism requires CUDA support\n", __func__);
+        return false;
+#endif
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -18522,6 +18566,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.gpus_tp                     =*/ 1,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

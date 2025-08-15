@@ -71,6 +71,16 @@ if (CUDAToolkit_FOUND)
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
+    # Check for NCCL
+    find_package(NCCL QUIET)
+    if (NCCL_FOUND)
+        message(STATUS "NCCL found, enabling tensor parallelism")
+        add_compile_definitions(GGML_USE_NCCL)
+        target_link_libraries(ggml-cuda PRIVATE NCCL::nccl)
+    else()
+        message(WARNING "NCCL not found, tensor parallelism will be disabled")
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

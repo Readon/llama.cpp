@@ -293,6 +293,7 @@ struct common_params {
     int32_t n_gpu_layers      = -1;  // number of layers to store in VRAM (-1 - use default)
     int32_t main_gpu          = 0;   // the GPU that is used for scratch and small tensors
     float   tensor_split[128] = {0}; // how split tensors should be distributed across GPUs
+    int32_t gpus_tp           = 1;   // number of GPUs per tensor parallel group
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
@@ -614,6 +615,9 @@ struct common_init_result     common_init_from_params(common_params & params);
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const cpu_params & params);
+
+// Validation functions
+bool common_validate_tensor_parallel_params(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

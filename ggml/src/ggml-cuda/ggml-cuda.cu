@@ -48,6 +48,7 @@
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
+#include "ggml-cuda/tensor-parallel.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml.h"
 
@@ -3788,5 +3789,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 
     return cuda_backend;
 }
+
+// tensor parallelism functions - implemented in tensor-parallel.cu
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

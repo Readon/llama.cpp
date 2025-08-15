@@ -2509,6 +2509,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"--gpus-tp"}, "N",
+        string_format("number of GPUs per tensor parallel group (default: %d)", params.gpus_tp),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("gpus-tp must be at least 1");
+            }
+            if (value > 8) {
+                throw std::invalid_argument("gpus-tp cannot exceed 8 (maximum supported tensor parallel size)");
+            }
+            params.gpus_tp = value;
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting gpus-tp has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_GPUS_TP"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {

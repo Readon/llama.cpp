@@ -1120,6 +1120,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.gpus_tp         = params.gpus_tp;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_mlock       = params.use_mlock;
     mparams.check_tensors   = params.check_tensors;
@@ -1143,6 +1144,27 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
 
     return mparams;
+}
+
+bool common_validate_tensor_parallel_params(const common_params & params) {
+    if (params.gpus_tp <= 1) {
+        return true; // No tensor parallelism, no validation needed
+    }
+
+    // Check if tensor parallelism is compatible with other parameters
+    if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        fprintf(stderr, "error: tensor parallelism (--gpus-tp) is only compatible with layer split mode\n");
+        return false;
+    }
+
+    // Check if we have a reasonable number of GPU layers for tensor parallelism
+    if (params.n_gpu_layers > 0 && params.n_gpu_layers < params.gpus_tp) {
+        fprintf(stderr, "warning: number of GPU layers (%d) is less than tensor parallel size (%d)\n",
+                params.n_gpu_layers, params.gpus_tp);
+        fprintf(stderr, "         this may result in inefficient GPU utilization\n");
+    }
+
+    return true;
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {

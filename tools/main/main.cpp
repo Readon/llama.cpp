@@ -125,6 +125,11 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // validate tensor parallelism parameters
+    if (!common_validate_tensor_parallel_params(params)) {
+        return 1;
+    }
+
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     common_sampler * smpl = nullptr;
