@@ -972,15 +972,6 @@ static size_t ggml_nbytes_split_col(const struct ggml_tensor * tensor, int ncols
     return ggml_nrows(tensor)*ggml_row_size(tensor->type, ncols_split);
 }
 
-struct ggml_backend_cuda_split_buffer_type_context {
-    int main_device;
-    std::array<float, GGML_CUDA_MAX_DEVICES> tensor_split;
-    std::string name;
-    int axis; // 0=row, 1=col
-#ifdef GGML_CUDA_USE_NCCL
-    ncclComm_t nccl_comm;
-#endif
-};
 
 struct ggml_backend_cuda_split_buffer_context {
     ~ggml_backend_cuda_split_buffer_context() {
@@ -4407,18 +4398,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type_v2(int main_devic
     }
 
 #ifdef GGML_CUDA_USE_NCCL
-    const int ndev = ggml_backend_cuda_get_device_count();
-    if (ndev > 1) {
-        std::vector<int> devs;
-        for (int i = 0; i < ndev; i++) {
-            if (tensor_split_arr[i] < (i + 1 < ndev ? tensor_split_arr[i+1] : 1.0f)) {
-                devs.push_back(i);
-            }
-        }
-        if (devs.size() > 1) {
-            NCCLCHECK(ncclCommInitAll(&ctx->nccl_comm, devs.size(), devs.data()));
-        }
-    }
+    // communicator is now initialized in llama_model::load_tensors
 #endif
 
     struct ggml_backend_buffer_type buft {

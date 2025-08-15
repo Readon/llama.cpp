@@ -11,6 +11,13 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
+#include "ggml-cuda.h"
+
+#ifdef GGML_CUDA_USE_NCCL
+#include "nccl.h"
+#define NCCL_CHECK(cmd) do {                                               ncclResult_t r = cmd;                                                  if (r!= ncclSuccess) {                                                     fprintf(stderr, "Failed, NCCL error %s:%d '%s'\n",                        __FILE__,__LINE__, ncclGetErrorString(r));                         exit(EXIT_FAILURE);                                                }                                                                  } while(0)
+#endif
+
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -2032,7 +2039,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts);
+
     if (params.tp_n > 1) {
+        if (hparams.n_head() % params.tp_n != 0) {
+            LLAMA_LOG_ERROR("%s: number of heads (%d) must be divisible by tp_n (%d)\n",
+                __func__, hparams.n_head(), params.tp_n);
+            return false;
+        }
         const int n_gpu_groups = devices.size() / params.tp_n;
         pimpl->gpu_buft_list_groups.resize(n_gpu_groups);
         pimpl->gpu_buft_list_groups_col.resize(n_gpu_groups);
@@ -2048,6 +2061,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             buft_list_t buft_list_row = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_ROW, pimpl->gpu_group_splits[i].data());
             buft_list_row.insert(buft_list_row.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
             pimpl->gpu_buft_list_groups[i] = std::move(buft_list_row);
+
+#ifdef GGML_CUDA_USE_NCCL
+            // initialize communicator for the group
+            std::vector<int> devs;
+            for (int j = 0; j < params.tp_n; ++j) {
+                devs.push_back(i * params.tp_n + j);
+            }
+            if (devs.size() > 1) {
+                // HACK: it is not guaranteed that the first buffer type is the split buffer type, but it is in practice
+                struct ggml_backend_cuda_split_buffer_type_context * buft_ctx = (struct ggml_backend_cuda_split_buffer_type_context *)pimpl->gpu_buft_list_groups[i][0].second->context;
+                ncclComm_t comm;
+                NCCL_CHECK(ncclCommInitAll(&comm, devs.size(), devs.data()));
+                buft_ctx->nccl_comm = comm;
+
+                buft_ctx = (struct ggml_backend_cuda_split_buffer_type_context *)pimpl->gpu_buft_list_groups_col[i][0].second->context;
+                buft_ctx->nccl_comm = comm;
+            }
+#endif
 
             // Create buffer list for the group (col-wise)
             buft_list_t buft_list_col = make_gpu_buft_list(main_dev, LLAMA_SPLIT_MODE_COL, pimpl->gpu_group_splits[i].data());
