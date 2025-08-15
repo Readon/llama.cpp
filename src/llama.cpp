@@ -198,14 +198,8 @@ static struct llama_model * llama_model_load_from_file_impl(
 
     // if using single GPU mode, remove all except the main GPU
     if (params.tp_n > 1) {
-        if (model->devices.size() % params.tp_n != 0) {
-            LLAMA_LOG_ERROR("%s: number of devices (%zu) is not divisible by tp_n (%d)\n",
-                __func__, model->devices.size(), params.tp_n);
-            llama_model_free(model);
-            return nullptr;
-        }
         int n_gpu_groups = 0;
-        if (params.tensor_split != nullptr) {
+        if (params.tensor_split) {
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (params.tensor_split[i] > 0.0f) {
                     n_gpu_groups++;

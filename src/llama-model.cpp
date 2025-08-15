@@ -2032,7 +2032,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts);
+
     if (params.tp_n > 1) {
+        if (hparams.n_head() % params.tp_n != 0) {
+            LLAMA_LOG_ERROR("%s: number of heads (%d) must be divisible by tp_n (%d)\n",
+                __func__, hparams.n_head(), params.tp_n);
+            return false;
+        }
         const int n_gpu_groups = devices.size() / params.tp_n;
         pimpl->gpu_buft_list_groups.resize(n_gpu_groups);
         pimpl->gpu_buft_list_groups_col.resize(n_gpu_groups);
