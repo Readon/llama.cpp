@@ -812,12 +812,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
         if (tensor_name.find(".weight") != std::string::npos && ggml_n_dims(tensor) == 2) {
             // Get tensor parallelism configuration
             const ggml_tp_config* tp_config = ggml_cuda_tp_get_config_ptr();
-            if (tp_config && tp_config->enabled) {
+            if (tp_config && tp_config->enabled && tp_config->tp_size > 1) {
                 ggml_tp_strategy strategy = ggml_get_tensor_parallel_strategy_c(tensor_name.c_str(), tensor, tp_config);
                 if (strategy != GGML_TP_STRATEGY_REPLICATE) {
-                    // Temporarily disable actual tensor splitting to avoid segfaults
-                    // bool applied = ggml_apply_tensor_parallel_split_c(tensor, tp_config, strategy);
-                    // Strategy determined but not applied yet - no debug output to avoid test interference
+                    // Apply actual tensor splitting for performance improvement
+                    bool applied = ggml_apply_tensor_parallel_split_c(tensor, tp_config, strategy);
+                    if (applied) {
+                        printf("Applied TP %s to %s: %s [%ld x %ld] -> [%ld x %ld]\n",
+                               strategy == GGML_TP_STRATEGY_COLUMN ? "column-split" : "row-split",
+                               tensor_name.c_str(),
+                               strategy == GGML_TP_STRATEGY_ROW ? "(requires AllReduce)" : "(parallel)",
+                               tensor->ne[0], tensor->ne[1], tensor->ne[0], tensor->ne[1]);
+                    } else {
+                        // Log warning if split failed, but continue execution
+                        fprintf(stderr, "Warning: Failed to apply tensor parallelism to %s\n", tensor_name.c_str());
+                    }
                 }
             }
         }

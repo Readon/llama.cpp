@@ -1,5 +1,6 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
+#include "tensor-parallel.cuh"
 
 #include <vector>
 
@@ -265,6 +266,31 @@ void ggml_cuda_op_mul_mat_q(
         use_stream_k};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+
+    // Apply tensor parallelism communication if needed
+    if (ggml_cuda_multi_tp_available()) {
+        // Check if this tensor requires AllReduce (row-split weights)
+        if (src0->src[0] != nullptr) {
+            ggml_tp_split_info* split_info = (ggml_tp_split_info*)src0->src[0];
+            if (split_info->strategy == GGML_TP_STRATEGY_ROW) {
+                // Row-split weights require AllReduce to combine partial results
+                const size_t dst_size = ggml_nbytes(dst);
+                const size_t element_count = dst_size / sizeof(float);
+
+                // Synchronize before AllReduce
+                cudaStreamSynchronize(stream);
+
+                // Perform AllReduce on the output to combine partial results
+                bool success = ggml_cuda_tp_allreduce_c(dst_dd_i, element_count, 0 /* ncclFloat32 */, 0 /* group_id */);
+                if (!success) {
+                    fprintf(stderr, "Warning: AllReduce failed for row-split tensor\n");
+                }
+
+                // Synchronize after AllReduce
+                cudaStreamSynchronize(stream);
+            }
+        }
+    }
 
     GGML_UNUSED(src1);
     GGML_UNUSED(dst);

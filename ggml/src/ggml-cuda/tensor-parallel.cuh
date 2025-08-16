@@ -21,6 +21,11 @@ struct ggml_tp_split_info {
     int64_t split_offset;   // Offset for this rank
     bool needs_all_reduce;  // Whether all-reduce is needed after computation
     bool needs_all_gather;  // Whether all-gather is needed after computation
+    ggml_tp_strategy strategy; // The tensor parallelism strategy used
+    int tp_rank;            // Tensor parallel rank
+    int tp_size;            // Tensor parallel size
+    int group_id;           // Which TP group this tensor belongs to
+    int64_t original_ne[GGML_MAX_DIMS]; // Original tensor dimensions
 };
 
 ggml_tp_split_info ggml_calculate_tp_split(const struct ggml_tensor* tensor,
@@ -59,12 +64,23 @@ namespace ggml_tp_utils {
     bool check_tp_compatibility(const struct ggml_tensor* tensor, int tp_size, int split_dim);
 }
 
+// Forward declarations for NCCL types
+#ifdef GGML_USE_NCCL
+#include <nccl.h>
+#else
+typedef void* ncclComm_t;
+#endif
+
 // Integration with CUDA backend
 struct ggml_backend_cuda_tp_context {
     ggml_tp_config config;
     std::vector<int> device_ids;
     bool nccl_initialized;
     int group_id;  // ID of this TP group
+
+    // NCCL communication resources
+    ncclComm_t nccl_comm;
+    cudaStream_t cuda_stream;
 
     ggml_backend_cuda_tp_context(int tp_size, const std::vector<int>& devices, int group_id = 0);
     ~ggml_backend_cuda_tp_context();
@@ -117,3 +133,28 @@ int ggml_cuda_tp_get_num_groups();
 
 // Get GPU ID for a specific group and rank
 int ggml_cuda_tp_get_device_id(int group_id, int rank);
+
+// NCCL communication functions
+#ifdef GGML_USE_NCCL
+bool ggml_cuda_tp_allreduce(void* data, size_t count, ncclDataType_t datatype, int group_id = 0);
+bool ggml_cuda_tp_allgather(void* sendbuf, void* recvbuf, size_t count, ncclDataType_t datatype, int group_id = 0);
+bool ggml_cuda_tp_reduce_scatter(void* sendbuf, void* recvbuf, size_t count, ncclDataType_t datatype, int group_id = 0);
+#else
+bool ggml_cuda_tp_allreduce(void* data, size_t count, int datatype, int group_id = 0);
+bool ggml_cuda_tp_allgather(void* sendbuf, void* recvbuf, size_t count, int datatype, int group_id = 0);
+bool ggml_cuda_tp_reduce_scatter(void* sendbuf, void* recvbuf, size_t count, int datatype, int group_id = 0);
+#endif
+
+// C interface functions
+extern "C" {
+    ggml_tp_strategy ggml_get_tensor_parallel_strategy_c(const char* tensor_name, const struct ggml_tensor* tensor, const ggml_tp_config* tp_config);
+    bool ggml_apply_tensor_parallel_split_c(struct ggml_tensor* tensor, const ggml_tp_config* tp_config, ggml_tp_strategy strategy);
+
+    // NCCL communication C interface
+    bool ggml_cuda_tp_allreduce_c(void* data, size_t count, int datatype, int group_id);
+    bool ggml_cuda_tp_allgather_c(void* sendbuf, void* recvbuf, size_t count, int datatype, int group_id);
+    bool ggml_cuda_tp_reduce_scatter_c(void* sendbuf, void* recvbuf, size_t count, int datatype, int group_id);
+
+    // Get TP configuration pointer
+    const ggml_tp_config* ggml_cuda_tp_get_config_ptr();
+}
