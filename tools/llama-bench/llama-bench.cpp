@@ -254,6 +254,7 @@ struct cmd_params {
     std::vector<std::string>         rpc_servers;
     std::vector<llama_split_mode>    split_mode;
     std::vector<int>                 main_gpu;
+    std::vector<int>                 gpus_tp;
     std::vector<bool>                no_kv_offload;
     std::vector<bool>                flash_attn;
     std::vector<std::vector<float>>  tensor_split;
@@ -291,6 +292,7 @@ static const cmd_params cmd_params_defaults = {
     /* rpc_servers          */ { "" },
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* main_gpu             */ { 0 },
+    /* gpus_tp              */ { 1 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { false },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -365,6 +367,8 @@ static void print_usage(int /* argc */, char ** argv) {
            join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                       (default: %s)\n",
            join(cmd_params_defaults.main_gpu, ",").c_str());
+    printf("  --gpus-tp <n>                             (default: %s)\n",
+           join(cmd_params_defaults.gpus_tp, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>              (default: %s)\n",
            join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <0|1>                   (default: %s)\n",
@@ -613,6 +617,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.main_gpu = parse_int_range(argv[i]);
+            } else if (arg == "--gpus-tp") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.gpus_tp.insert(params.gpus_tp.end(), p.begin(), p.end());
             } else if (arg == "-nkvo" || arg == "--no-kv-offload") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -864,6 +875,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
+    if (params.gpus_tp.empty()) {
+        params.gpus_tp = cmd_params_defaults.gpus_tp;
+    }
     if (params.no_kv_offload.empty()) {
         params.no_kv_offload = cmd_params_defaults.no_kv_offload;
     }
@@ -919,6 +933,7 @@ struct cmd_params_instance {
     std::string        rpc_servers_str;
     llama_split_mode   split_mode;
     int                main_gpu;
+    int                gpus_tp;
     bool               no_kv_offload;
     bool               flash_attn;
     std::vector<float> tensor_split;
@@ -980,6 +995,7 @@ struct cmd_params_instance {
         }
         mparams.split_mode   = split_mode;
         mparams.main_gpu     = main_gpu;
+        mparams.gpus_tp      = gpus_tp;
         mparams.tensor_split = tensor_split.data();
         mparams.use_mmap     = use_mmap;
 
@@ -995,7 +1011,7 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && rpc_servers_str == other.rpc_servers_str &&
-               split_mode == other.split_mode && main_gpu == other.main_gpu && use_mmap == other.use_mmap &&
+               split_mode == other.split_mode && main_gpu == other.main_gpu && gpus_tp == other.gpus_tp && use_mmap == other.use_mmap &&
                tensor_split == other.tensor_split && vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1028,6 +1044,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & rpc : params.rpc_servers)
     for (const auto & sm : params.split_mode)
     for (const auto & mg : params.main_gpu)
+    for (const auto & gtp : params.gpus_tp)
     for (const auto & ts : params.tensor_split)
     for (const auto & ot : params.tensor_buft_overrides)
     for (const auto & mmp : params.use_mmap)
@@ -1067,6 +1084,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .rpc_servers  = */ rpc,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
+                /* .gpus_tp      = */ gtp,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .tensor_split = */ ts,
@@ -1100,6 +1118,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .rpc_servers  = */ rpc,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
+                /* .gpus_tp      = */ gtp,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .tensor_split = */ ts,
@@ -1133,6 +1152,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .rpc_servers  = */ rpc,
                 /* .split_mode   = */ sm,
                 /* .main_gpu     = */ mg,
+                /* .gpus_tp      = */ gtp,
                 /* .no_kv_offload= */ nkvo,
                 /* .flash_attn   = */ fa,
                 /* .tensor_split = */ ts,
@@ -1170,6 +1190,7 @@ struct test {
     int                      n_gpu_layers;
     llama_split_mode         split_mode;
     int                      main_gpu;
+    int                      gpus_tp;
     bool                     no_kv_offload;
     bool                     flash_attn;
     std::vector<float>       tensor_split;
@@ -1205,6 +1226,7 @@ struct test {
         n_gpu_layers   = inst.n_gpu_layers;
         split_mode     = inst.split_mode;
         main_gpu       = inst.main_gpu;
+        gpus_tp        = inst.gpus_tp;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
         tensor_split   = inst.tensor_split;
@@ -1256,7 +1278,7 @@ struct test {
             "build_commit", "build_number", "cpu_info",       "gpu_info",   "backends",     "model_filename",
             "model_type",   "model_size",   "model_n_params", "n_batch",    "n_ubatch",     "n_threads",
             "cpu_mask",     "cpu_strict",   "poll",           "type_k",     "type_v",       "n_gpu_layers",
-            "split_mode",   "main_gpu",     "no_kv_offload",  "flash_attn", "tensor_split", "tensor_buft_overrides",
+            "split_mode",   "main_gpu",     "gpus_tp",        "no_kv_offload",  "flash_attn", "tensor_split", "tensor_buft_overrides",
             "defrag_thold",
             "use_mmap",     "embeddings",   "no_op_offload",   "n_prompt",       "n_gen",      "n_depth",      "test_time",
             "avg_ns",       "stddev_ns",    "avg_ts",         "stddev_ts",
@@ -1269,7 +1291,7 @@ struct test {
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" ||
+            field == "main_gpu" || field == "gpus_tp" || field == "n_prompt" || field == "n_gen" || field == "n_depth" ||
             field == "avg_ns" || field == "stddev_ns" || field == "no_op_offload") {
             return INT;
         }
@@ -1340,6 +1362,7 @@ struct test {
                                             std::to_string(n_gpu_layers),
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
+                                            std::to_string(gpus_tp),
                                             std::to_string(no_kv_offload),
                                             std::to_string(flash_attn),
                                             tensor_split_str,
