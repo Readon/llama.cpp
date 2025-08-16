@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/tensor-parallel.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -558,6 +559,41 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    int device_id = ctx->device;
+
+    if (ggml_cuda_multi_tp_available()) {
+        int gpus_per_group = g_cuda_multi_tp_ctx->gpus_per_group;
+        int group_id = device_id / gpus_per_group;
+        int rank = device_id % gpus_per_group;
+
+        if (group_id < g_cuda_multi_tp_ctx->num_groups) {
+            ggml_tp_config tp_config = { gpus_per_group, rank, true };
+            ggml_tp_strategy strategy = ggml_get_tensor_parallel_strategy(tensor->name, tensor, tp_config);
+
+            if (strategy != GGML_TP_STRATEGY_REPLICATE) {
+                ggml_apply_tensor_parallel_split(tensor, tp_config, strategy);
+            }
+        }
+    } else if (ggml_cuda_tp_available()) {
+        // legacy single-group TP
+        const ggml_tp_config & tp_config_base = ggml_cuda_tp_get_config(0);
+        if (tp_config_base.enabled) {
+            int rank = -1;
+            for (size_t i = 0; i < g_cuda_tp_ctx->device_ids.size(); ++i) {
+                if (g_cuda_tp_ctx->device_ids[i] == device_id) {
+                    rank = i;
+                    break;
+                }
+            }
+            if (rank != -1) {
+                ggml_tp_config tp_config = { tp_config_base.tp_size, rank, true };
+                ggml_tp_strategy strategy = ggml_get_tensor_parallel_strategy(tensor->name, tensor, tp_config);
+                if (strategy != GGML_TP_STRATEGY_REPLICATE) {
+                    ggml_apply_tensor_parallel_split(tensor, tp_config, strategy);
+                }
+            }
+        }
+    }
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);

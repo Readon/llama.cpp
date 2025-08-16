@@ -21,10 +21,61 @@ struct ggml_tp_config {
     ggml_tp_config(int size, int rank) : tp_size(size), tp_rank(rank), enabled(size > 1) {}
 };
 
+// Tensor name patterns for different TP strategies
+namespace ggml_tp_patterns {
+    // Patterns that should use column-wise splitting
+    extern const char* column_split_patterns[];
+
+    // Patterns that should use row-wise splitting
+    extern const char* row_split_patterns[];
+
+    // Patterns that should be replicated
+    extern const char* replicate_patterns[];
+
+    // Check if tensor name matches any pattern in the list
+    inline bool matches_pattern(const std::string& tensor_name, const char* patterns[]) {
+        for (int i = 0; patterns[i] != nullptr; i++) {
+            if (tensor_name.find(patterns[i]) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
 // Determine tensor parallelism strategy based on tensor name and properties
-ggml_tp_strategy ggml_get_tensor_parallel_strategy(const std::string& tensor_name, 
+inline ggml_tp_strategy ggml_get_tensor_parallel_strategy(const std::string& tensor_name,
                                                    const struct ggml_tensor* tensor,
-                                                   const ggml_tp_config& tp_config);
+                                                   const ggml_tp_config& tp_config) {
+    if (!tp_config.enabled) {
+        return GGML_TP_STRATEGY_REPLICATE;
+    }
+
+    // Check for explicit patterns first
+    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::column_split_patterns)) {
+        return GGML_TP_STRATEGY_COLUMN;
+    }
+
+    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::row_split_patterns)) {
+        return GGML_TP_STRATEGY_ROW;
+    }
+
+    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::replicate_patterns)) {
+        return GGML_TP_STRATEGY_REPLICATE;
+    }
+
+    // Auto-determine strategy based on tensor properties
+    if (tensor->ne[0] % tp_config.tp_size == 0 && tensor->ne[0] >= tp_config.tp_size) {
+        // Can split along first dimension
+        return GGML_TP_STRATEGY_ROW;
+    } else if (tensor->ne[1] % tp_config.tp_size == 0 && tensor->ne[1] >= tp_config.tp_size) {
+        // Can split along second dimension
+        return GGML_TP_STRATEGY_COLUMN;
+    }
+
+    // Default to replication
+    return GGML_TP_STRATEGY_REPLICATE;
+}
 
 // Check if a tensor should use tensor parallelism
 bool ggml_tensor_supports_tp(const std::string& tensor_name, const struct ggml_tensor* tensor);
@@ -38,28 +89,74 @@ struct ggml_tp_split_info {
     bool needs_all_gather;  // Whether all-gather is needed after computation
 };
 
-ggml_tp_split_info ggml_calculate_tp_split(const struct ggml_tensor* tensor,
+inline ggml_tp_split_info ggml_calculate_tp_split(const struct ggml_tensor* tensor,
                                           ggml_tp_strategy strategy,
-                                          const ggml_tp_config& tp_config);
+                                          const ggml_tp_config& tp_config) {
+    ggml_tp_split_info info = {};
+    info.split_dim = -1;
+    info.split_size = 0;
+    info.split_offset = 0;
+    info.needs_all_reduce = false;
+    info.needs_all_gather = false;
+
+    if (!tp_config.enabled || strategy == GGML_TP_STRATEGY_REPLICATE) {
+        return info;
+    }
+
+    switch (strategy) {
+        case GGML_TP_STRATEGY_COLUMN:
+            if (tensor->ne[1] % tp_config.tp_size == 0) {
+                info.split_dim = 1;
+                info.split_size = tensor->ne[1] / tp_config.tp_size;
+                info.split_offset = tp_config.tp_rank * info.split_size;
+                info.needs_all_reduce = true;
+            }
+            break;
+
+        case GGML_TP_STRATEGY_ROW:
+            if (tensor->ne[0] % tp_config.tp_size == 0) {
+                info.split_dim = 0;
+                info.split_size = tensor->ne[0] / tp_config.tp_size;
+                info.split_offset = tp_config.tp_rank * info.split_size;
+                info.needs_all_gather = true;
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return info;
+}
 
 // Apply tensor parallelism to a tensor during model loading
-bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
+inline bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
                                      const ggml_tp_config& tp_config,
-                                     ggml_tp_strategy strategy);
+                                     ggml_tp_strategy strategy) {
+    if (!tp_config.enabled || strategy == GGML_TP_STRATEGY_REPLICATE) {
+        return true;
+    }
 
-// Tensor name patterns for different TP strategies
-namespace ggml_tp_patterns {
-    // Patterns that should use column-wise splitting
-    extern const char* column_split_patterns[];
-    
-    // Patterns that should use row-wise splitting  
-    extern const char* row_split_patterns[];
-    
-    // Patterns that should be replicated
-    extern const char* replicate_patterns[];
-    
-    // Check if tensor name matches any pattern in the list
-    bool matches_pattern(const std::string& tensor_name, const char* patterns[]);
+    ggml_tp_split_info split_info = ggml_calculate_tp_split(tensor, strategy, tp_config);
+
+    if (split_info.split_dim == -1) {
+        return false; // Cannot split this tensor
+    }
+
+    // Modify tensor dimensions to reflect the split
+    if (split_info.split_dim == 0) {
+        tensor->ne[0] = split_info.split_size;
+    } else if (split_info.split_dim == 1) {
+        tensor->ne[1] = split_info.split_size;
+    }
+
+    // Recalculate strides
+    tensor->nb[0] = ggml_type_size(tensor->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        tensor->nb[i] = tensor->nb[i-1] * tensor->ne[i-1];
+    }
+
+    return true;
 }
 
 // Utility functions for tensor parallel operations

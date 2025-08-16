@@ -49,39 +49,6 @@ namespace ggml_tp_patterns {
     }
 }
 
-ggml_tp_strategy ggml_get_tensor_parallel_strategy(const std::string& tensor_name,
-                                                   const struct ggml_tensor* tensor,
-                                                   const ggml_tp_config& tp_config) {
-    if (!tp_config.enabled) {
-        return GGML_TP_STRATEGY_REPLICATE;
-    }
-    
-    // Check for explicit patterns first
-    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::column_split_patterns)) {
-        return GGML_TP_STRATEGY_COLUMN;
-    }
-    
-    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::row_split_patterns)) {
-        return GGML_TP_STRATEGY_ROW;
-    }
-    
-    if (ggml_tp_patterns::matches_pattern(tensor_name, ggml_tp_patterns::replicate_patterns)) {
-        return GGML_TP_STRATEGY_REPLICATE;
-    }
-    
-    // Auto-determine strategy based on tensor properties
-    if (tensor->ne[0] % tp_config.tp_size == 0 && tensor->ne[0] >= tp_config.tp_size) {
-        // Can split along first dimension
-        return GGML_TP_STRATEGY_ROW;
-    } else if (tensor->ne[1] % tp_config.tp_size == 0 && tensor->ne[1] >= tp_config.tp_size) {
-        // Can split along second dimension  
-        return GGML_TP_STRATEGY_COLUMN;
-    }
-    
-    // Default to replication
-    return GGML_TP_STRATEGY_REPLICATE;
-}
-
 bool ggml_tensor_supports_tp(const std::string& tensor_name, const struct ggml_tensor* tensor) {
     // Only support tensor parallelism for 2D weight matrices
     if (ggml_n_dims(tensor) != 2) {
@@ -95,75 +62,6 @@ bool ggml_tensor_supports_tp(const std::string& tensor_name, const struct ggml_t
 
     // Check if it's a weight tensor (not bias or other parameters)
     return tensor_name.find(".weight") != std::string::npos;
-}
-
-ggml_tp_split_info ggml_calculate_tp_split(const struct ggml_tensor* tensor,
-                                          ggml_tp_strategy strategy,
-                                          const ggml_tp_config& tp_config) {
-    ggml_tp_split_info info = {};
-    info.split_dim = -1;
-    info.split_size = 0;
-    info.split_offset = 0;
-    info.needs_all_reduce = false;
-    info.needs_all_gather = false;
-    
-    if (!tp_config.enabled || strategy == GGML_TP_STRATEGY_REPLICATE) {
-        return info;
-    }
-    
-    switch (strategy) {
-        case GGML_TP_STRATEGY_COLUMN:
-            if (tensor->ne[1] % tp_config.tp_size == 0) {
-                info.split_dim = 1;
-                info.split_size = tensor->ne[1] / tp_config.tp_size;
-                info.split_offset = tp_config.tp_rank * info.split_size;
-                info.needs_all_reduce = true;
-            }
-            break;
-            
-        case GGML_TP_STRATEGY_ROW:
-            if (tensor->ne[0] % tp_config.tp_size == 0) {
-                info.split_dim = 0;
-                info.split_size = tensor->ne[0] / tp_config.tp_size;
-                info.split_offset = tp_config.tp_rank * info.split_size;
-                info.needs_all_gather = true;
-            }
-            break;
-            
-        default:
-            break;
-    }
-    
-    return info;
-}
-
-bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
-                                     const ggml_tp_config& tp_config,
-                                     ggml_tp_strategy strategy) {
-    if (!tp_config.enabled || strategy == GGML_TP_STRATEGY_REPLICATE) {
-        return true;
-    }
-    
-    ggml_tp_split_info split_info = ggml_calculate_tp_split(tensor, strategy, tp_config);
-    
-    if (split_info.split_dim == -1) {
-        return false; // Cannot split this tensor
-    }
-    
-    // Modify tensor dimensions to reflect the split
-    if (split_info.split_dim == 0) {
-        tensor->ne[0] = split_info.split_size;
-    } else if (split_info.split_dim == 1) {
-        tensor->ne[1] = split_info.split_size;
-    }
-    
-    // Recalculate strides
-    tensor->nb[0] = ggml_type_size(tensor->type);
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        tensor->nb[i] = tensor->nb[i-1] * tensor->ne[i-1];
-    }
-    
-    return true;
 }
 
 namespace ggml_tp_utils {
@@ -309,16 +207,6 @@ bool ggml_cuda_multi_tp_available() {
     return g_cuda_multi_tp_ctx != nullptr && g_cuda_multi_tp_ctx->num_groups > 0;
 }
 
-const ggml_tp_config& ggml_cuda_tp_get_config() {
-    static ggml_tp_config default_config;
-    if (g_cuda_multi_tp_ctx && g_cuda_multi_tp_ctx->num_groups > 0) {
-        return g_cuda_multi_tp_ctx->get_config(0);  // Return first group for compatibility
-    }
-    if (g_cuda_tp_ctx) {
-        return g_cuda_tp_ctx->config;
-    }
-    return default_config;
-}
 
 const ggml_tp_config& ggml_cuda_tp_get_config(int group_id) {
     static ggml_tp_config default_config;
@@ -370,6 +258,8 @@ bool ggml_cuda_multi_tp_init(int num_groups, int gpus_per_group) {
     if (num_groups <= 0 || gpus_per_group <= 1) {
         return true;
     }
+
+    GGML_LOG_INFO("Multi-TP init called with %d groups and %d GPUs per group\n", num_groups, gpus_per_group);
 
     g_cuda_multi_tp_ctx = std::make_unique<ggml_backend_cuda_multi_tp_context>(num_groups, gpus_per_group);
     return g_cuda_multi_tp_ctx->init_all_groups();
