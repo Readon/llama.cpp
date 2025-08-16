@@ -1,25 +1,10 @@
 #pragma once
 
 #include "common.cuh"
+#include "ggml-cuda.h"
 #include <string>
 
-// Tensor parallelism strategies
-enum ggml_tp_strategy {
-    GGML_TP_STRATEGY_REPLICATE,  // Replicate tensor across all GPUs
-    GGML_TP_STRATEGY_COLUMN,     // Split tensor column-wise (along last dimension)
-    GGML_TP_STRATEGY_ROW,        // Split tensor row-wise (along first dimension)
-    GGML_TP_STRATEGY_AUTO        // Automatically determine strategy
-};
-
-// Tensor parallelism configuration
-struct ggml_tp_config {
-    int tp_size;        // Number of GPUs in tensor parallel group
-    int tp_rank;        // Rank of current GPU in the group
-    bool enabled;       // Whether tensor parallelism is enabled
-    
-    ggml_tp_config() : tp_size(1), tp_rank(0), enabled(false) {}
-    ggml_tp_config(int size, int rank) : tp_size(size), tp_rank(rank), enabled(size > 1) {}
-};
+// Use the types defined in ggml-cuda.h to avoid redefinition
 
 // Determine tensor parallelism strategy based on tensor name and properties
 ggml_tp_strategy ggml_get_tensor_parallel_strategy(const std::string& tensor_name, 

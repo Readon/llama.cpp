@@ -252,10 +252,12 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // disable pipeline parallelism when tensor parallelism is enabled
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.params.n_gpu_layers > (int) model.hparams.n_layer &&
             model.params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
+            model.params.gpus_tp <= 1 &&  // disable when tensor parallelism is enabled
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 

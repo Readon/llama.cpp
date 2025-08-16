@@ -45,6 +45,24 @@ GGML_BACKEND_API bool ggml_cuda_multi_tp_available(void);
 GGML_BACKEND_API int ggml_cuda_tp_get_num_groups(void);
 GGML_BACKEND_API int ggml_cuda_tp_get_device_id(int group_id, int rank);
 
+// tensor parallelism strategy and splitting functions
+typedef enum {
+    GGML_TP_STRATEGY_REPLICATE = 0,
+    GGML_TP_STRATEGY_COLUMN = 1,
+    GGML_TP_STRATEGY_ROW = 2,
+    GGML_TP_STRATEGY_AUTO = 3
+} ggml_tp_strategy;
+
+typedef struct {
+    int tp_size;
+    int tp_rank;
+    bool enabled;
+} ggml_tp_config;
+
+GGML_BACKEND_API const ggml_tp_config* ggml_cuda_tp_get_config_ptr(void);
+GGML_BACKEND_API ggml_tp_strategy ggml_get_tensor_parallel_strategy_c(const char* tensor_name, const struct ggml_tensor* tensor, const ggml_tp_config* tp_config);
+GGML_BACKEND_API bool ggml_apply_tensor_parallel_split_c(struct ggml_tensor* tensor, const ggml_tp_config* tp_config, ggml_tp_strategy strategy);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

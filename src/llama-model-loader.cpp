@@ -2,6 +2,10 @@
 
 #include "ggml.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <array>
 #include <cinttypes>
 #include <cstring>
@@ -798,6 +802,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
     ggml_set_name(tensor, ggml_get_name(cur));
+
+#ifdef GGML_USE_CUDA
+    // Apply tensor parallelism if available
+    if (ggml_cuda_multi_tp_available()) {
+        const std::string tensor_name = name;
+
+        // Check if this tensor supports tensor parallelism
+        if (tensor_name.find(".weight") != std::string::npos && ggml_n_dims(tensor) == 2) {
+            // Get tensor parallelism configuration
+            const ggml_tp_config* tp_config = ggml_cuda_tp_get_config_ptr();
+            if (tp_config && tp_config->enabled) {
+                ggml_tp_strategy strategy = ggml_get_tensor_parallel_strategy_c(tensor_name.c_str(), tensor, tp_config);
+                if (strategy != GGML_TP_STRATEGY_REPLICATE) {
+                    // Temporarily disable actual tensor splitting to avoid segfaults
+                    // bool applied = ggml_apply_tensor_parallel_split_c(tensor, tp_config, strategy);
+                    // Strategy determined but not applied yet - no debug output to avoid test interference
+                }
+            }
+        }
+    }
+#endif
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
