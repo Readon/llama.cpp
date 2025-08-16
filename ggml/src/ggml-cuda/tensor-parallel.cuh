@@ -79,19 +79,38 @@ struct ggml_backend_cuda_tp_context {
     ggml_tp_config config;
     std::vector<int> device_ids;
     bool nccl_initialized;
-    
-    ggml_backend_cuda_tp_context(int tp_size, const std::vector<int>& devices);
+    int group_id;  // ID of this TP group
+
+    ggml_backend_cuda_tp_context(int tp_size, const std::vector<int>& devices, int group_id = 0);
     ~ggml_backend_cuda_tp_context();
-    
+
     bool init();
     void cleanup();
 };
 
-// Global tensor parallelism context
-extern std::unique_ptr<ggml_backend_cuda_tp_context> g_cuda_tp_ctx;
+// Multi-group tensor parallelism manager
+struct ggml_backend_cuda_multi_tp_context {
+    std::vector<std::unique_ptr<ggml_backend_cuda_tp_context>> tp_groups;
+    int num_groups;
+    int gpus_per_group;
 
-// Initialize CUDA tensor parallelism
+    ggml_backend_cuda_multi_tp_context(int num_groups, int gpus_per_group);
+    ~ggml_backend_cuda_multi_tp_context();
+
+    bool init_all_groups();
+    void cleanup_all_groups();
+    ggml_backend_cuda_tp_context* get_group(int group_id);
+    const ggml_tp_config& get_config(int group_id);
+};
+
+// Global multi-group tensor parallelism context
+extern std::unique_ptr<ggml_backend_cuda_multi_tp_context> g_cuda_multi_tp_ctx;
+
+// Initialize CUDA tensor parallelism (legacy single-group interface)
 bool ggml_cuda_tp_init(int tp_size, const int* device_ids, int num_devices);
+
+// Initialize multi-group CUDA tensor parallelism
+bool ggml_cuda_multi_tp_init(int num_groups, int gpus_per_group);
 
 // Cleanup CUDA tensor parallelism
 void ggml_cuda_tp_cleanup();
@@ -99,5 +118,17 @@ void ggml_cuda_tp_cleanup();
 // Check if CUDA tensor parallelism is available
 bool ggml_cuda_tp_available();
 
-// Get the current TP configuration
+// Check if multi-group tensor parallelism is available
+bool ggml_cuda_multi_tp_available();
+
+// Get the current TP configuration (for single-group compatibility)
 const ggml_tp_config& ggml_cuda_tp_get_config();
+
+// Get TP configuration for a specific group
+const ggml_tp_config& ggml_cuda_tp_get_config(int group_id);
+
+// Get the number of TP groups
+int ggml_cuda_tp_get_num_groups();
+
+// Get GPU ID for a specific group and rank
+int ggml_cuda_tp_get_device_id(int group_id, int rank);

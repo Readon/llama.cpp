@@ -39,7 +39,11 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 
 // tensor parallelism functions
 GGML_BACKEND_API bool ggml_cuda_tp_init(int tp_size, const int* device_ids, int num_devices);
+GGML_BACKEND_API bool ggml_cuda_multi_tp_init(int num_groups, int gpus_per_group);
 GGML_BACKEND_API void ggml_cuda_tp_cleanup(void);
+GGML_BACKEND_API bool ggml_cuda_multi_tp_available(void);
+GGML_BACKEND_API int ggml_cuda_tp_get_num_groups(void);
+GGML_BACKEND_API int ggml_cuda_tp_get_device_id(int group_id, int rank);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);

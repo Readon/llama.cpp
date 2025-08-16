@@ -19,7 +19,11 @@
 #ifdef GGML_USE_CUDA
 extern "C" {
 bool ggml_cuda_tp_init(int tp_size, const int* device_ids, int num_devices);
+bool ggml_cuda_multi_tp_init(int num_groups, int gpus_per_group);
 void ggml_cuda_tp_cleanup();
+bool ggml_cuda_multi_tp_available();
+int ggml_cuda_tp_get_num_groups();
+int ggml_cuda_tp_get_device_id(int group_id, int rank);
 }
 #endif
 #include <cassert>
@@ -1964,20 +1968,50 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
 #ifdef GGML_USE_CUDA
-        // Use the first gpus_tp devices for tensor parallelism
-        // This creates a single tensor parallel group using the specified number of GPUs
-        std::vector<int> device_ids;
-        for (int i = 0; i < gpus_tp; i++) {
-            device_ids.push_back(i);
+        // Calculate number of tensor parallel groups
+        int total_gpus = static_cast<int>(devices.size());
+        int num_tp_groups = total_gpus / gpus_tp;
+
+        if (total_gpus % gpus_tp != 0) {
+            LLAMA_LOG_WARN("%s: total GPUs (%d) is not divisible by gpus_tp (%d), using %d complete groups\n",
+                __func__, total_gpus, gpus_tp, num_tp_groups);
+            LLAMA_LOG_WARN("%s: %d GPUs will be unused\n", __func__, total_gpus % gpus_tp);
         }
 
-        if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
-            LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
+        if (num_tp_groups == 0) {
+            LLAMA_LOG_ERROR("%s: not enough GPUs to form even one tensor parallel group\n", __func__);
             return false;
         }
 
-        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
-            __func__, gpus_tp, gpus_tp - 1);
+        if (num_tp_groups > 1) {
+            // Initialize multi-group tensor parallelism
+            LLAMA_LOG_INFO("%s: initializing multi-group tensor parallelism: %d groups, each with %d GPUs\n",
+                __func__, num_tp_groups, gpus_tp);
+
+            if (!ggml_cuda_multi_tp_init(num_tp_groups, gpus_tp)) {
+                LLAMA_LOG_ERROR("%s: failed to initialize multi-group tensor parallelism\n", __func__);
+                return false;
+            }
+
+            LLAMA_LOG_INFO("%s: multi-group tensor parallelism enabled with %d groups of %d GPUs each\n",
+                __func__, num_tp_groups, gpus_tp);
+            LLAMA_LOG_INFO("%s: total GPUs used: %d (GPUs 0-%d)\n",
+                __func__, num_tp_groups * gpus_tp, num_tp_groups * gpus_tp - 1);
+        } else {
+            // Initialize single-group tensor parallelism (legacy mode)
+            std::vector<int> device_ids;
+            for (int i = 0; i < gpus_tp; i++) {
+                device_ids.push_back(i);
+            }
+
+            if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
+                LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
+                return false;
+            }
+
+            LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
+                __func__, gpus_tp, gpus_tp - 1);
+        }
 #else
         LLAMA_LOG_ERROR("%s: tensor parallelism requires CUDA support\n", __func__);
         return false;

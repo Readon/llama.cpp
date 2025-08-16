@@ -3,8 +3,9 @@
 #include <algorithm>
 #include <cstring>
 
-// Global tensor parallelism context
+// Global tensor parallelism contexts
 std::unique_ptr<ggml_backend_cuda_tp_context> g_cuda_tp_ctx = nullptr;
+std::unique_ptr<ggml_backend_cuda_multi_tp_context> g_cuda_multi_tp_ctx = nullptr;
 
 // Tensor name patterns for different TP strategies
 namespace ggml_tp_patterns {
@@ -200,8 +201,8 @@ namespace ggml_tp_utils {
     }
 }
 
-ggml_backend_cuda_tp_context::ggml_backend_cuda_tp_context(int tp_size, const std::vector<int>& devices)
-    : config(tp_size, 0), device_ids(devices), nccl_initialized(false) {
+ggml_backend_cuda_tp_context::ggml_backend_cuda_tp_context(int tp_size, const std::vector<int>& devices, int group_id)
+    : config(tp_size, 0), device_ids(devices), nccl_initialized(false), group_id(group_id) {
 }
 
 ggml_backend_cuda_tp_context::~ggml_backend_cuda_tp_context() {
@@ -239,18 +240,118 @@ void ggml_backend_cuda_tp_context::cleanup() {
     }
 }
 
+// Multi-group tensor parallelism implementation
+ggml_backend_cuda_multi_tp_context::ggml_backend_cuda_multi_tp_context(int num_groups, int gpus_per_group)
+    : num_groups(num_groups), gpus_per_group(gpus_per_group) {
+    tp_groups.reserve(num_groups);
+}
+
+ggml_backend_cuda_multi_tp_context::~ggml_backend_cuda_multi_tp_context() {
+    cleanup_all_groups();
+}
+
+bool ggml_backend_cuda_multi_tp_context::init_all_groups() {
+    GGML_LOG_INFO("Initializing %d tensor parallel groups, each with %d GPUs\n", num_groups, gpus_per_group);
+
+    for (int group = 0; group < num_groups; group++) {
+        std::vector<int> device_ids;
+        for (int i = 0; i < gpus_per_group; i++) {
+            int gpu_id = group * gpus_per_group + i;
+            device_ids.push_back(gpu_id);
+        }
+
+        auto tp_ctx = std::make_unique<ggml_backend_cuda_tp_context>(gpus_per_group, device_ids, group);
+        if (!tp_ctx->init()) {
+            GGML_LOG_ERROR("Failed to initialize tensor parallelism for group %d\n", group);
+            return false;
+        }
+
+        GGML_LOG_INFO("TP group %d initialized with GPUs ", group);
+        for (size_t i = 0; i < device_ids.size(); i++) {
+            GGML_LOG_INFO("%d%s", device_ids[i], (i < device_ids.size() - 1) ? "," : "");
+        }
+        GGML_LOG_INFO("\n");
+
+        tp_groups.push_back(std::move(tp_ctx));
+    }
+
+    return true;
+}
+
+void ggml_backend_cuda_multi_tp_context::cleanup_all_groups() {
+    tp_groups.clear();
+}
+
+ggml_backend_cuda_tp_context* ggml_backend_cuda_multi_tp_context::get_group(int group_id) {
+    if (group_id >= 0 && group_id < static_cast<int>(tp_groups.size())) {
+        return tp_groups[group_id].get();
+    }
+    return nullptr;
+}
+
+const ggml_tp_config& ggml_backend_cuda_multi_tp_context::get_config(int group_id) {
+    static ggml_tp_config default_config;
+    auto* group = get_group(group_id);
+    if (group) {
+        return group->config;
+    }
+    return default_config;
+}
+
 
 
 bool ggml_cuda_tp_available() {
-    return g_cuda_tp_ctx != nullptr && g_cuda_tp_ctx->config.enabled;
+    return (g_cuda_tp_ctx != nullptr && g_cuda_tp_ctx->config.enabled) ||
+           (g_cuda_multi_tp_ctx != nullptr && g_cuda_multi_tp_ctx->num_groups > 0);
+}
+
+bool ggml_cuda_multi_tp_available() {
+    return g_cuda_multi_tp_ctx != nullptr && g_cuda_multi_tp_ctx->num_groups > 0;
 }
 
 const ggml_tp_config& ggml_cuda_tp_get_config() {
     static ggml_tp_config default_config;
+    if (g_cuda_multi_tp_ctx && g_cuda_multi_tp_ctx->num_groups > 0) {
+        return g_cuda_multi_tp_ctx->get_config(0);  // Return first group for compatibility
+    }
     if (g_cuda_tp_ctx) {
         return g_cuda_tp_ctx->config;
     }
     return default_config;
+}
+
+const ggml_tp_config& ggml_cuda_tp_get_config(int group_id) {
+    static ggml_tp_config default_config;
+    if (g_cuda_multi_tp_ctx) {
+        return g_cuda_multi_tp_ctx->get_config(group_id);
+    }
+    if (g_cuda_tp_ctx && group_id == 0) {
+        return g_cuda_tp_ctx->config;
+    }
+    return default_config;
+}
+
+int ggml_cuda_tp_get_num_groups() {
+    if (g_cuda_multi_tp_ctx) {
+        return g_cuda_multi_tp_ctx->num_groups;
+    }
+    if (g_cuda_tp_ctx && g_cuda_tp_ctx->config.enabled) {
+        return 1;
+    }
+    return 0;
+}
+
+int ggml_cuda_tp_get_device_id(int group_id, int rank) {
+    if (g_cuda_multi_tp_ctx) {
+        auto* group = g_cuda_multi_tp_ctx->get_group(group_id);
+        if (group && rank >= 0 && rank < static_cast<int>(group->device_ids.size())) {
+            return group->device_ids[rank];
+        }
+    }
+    if (g_cuda_tp_ctx && group_id == 0 && rank >= 0 && rank < static_cast<int>(g_cuda_tp_ctx->device_ids.size())) {
+        return g_cuda_tp_ctx->device_ids[rank];
+    }
+    return -1;
 }
 
 // C interface functions for external linkage
@@ -261,11 +362,21 @@ bool ggml_cuda_tp_init(int tp_size, const int* device_ids, int num_devices) {
     }
 
     std::vector<int> device_vec(device_ids, device_ids + num_devices);
-    g_cuda_tp_ctx = std::make_unique<ggml_backend_cuda_tp_context>(tp_size, device_vec);
+    g_cuda_tp_ctx = std::make_unique<ggml_backend_cuda_tp_context>(tp_size, device_vec, 0);
     return g_cuda_tp_ctx->init();
+}
+
+bool ggml_cuda_multi_tp_init(int num_groups, int gpus_per_group) {
+    if (num_groups <= 0 || gpus_per_group <= 1) {
+        return true;
+    }
+
+    g_cuda_multi_tp_ctx = std::make_unique<ggml_backend_cuda_multi_tp_context>(num_groups, gpus_per_group);
+    return g_cuda_multi_tp_ctx->init_all_groups();
 }
 
 void ggml_cuda_tp_cleanup() {
     g_cuda_tp_ctx.reset();
+    g_cuda_multi_tp_ctx.reset();
 }
 }
