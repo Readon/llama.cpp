@@ -1957,18 +1957,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         // check if we have enough devices for tensor parallelism
-        if ((int)devices.size() % gpus_tp != 0) {
-            LLAMA_LOG_ERROR("%s: number of available GPUs (%zu) must be divisible by gpus_tp (%d)\n",
-                __func__, devices.size(), gpus_tp);
+        if ((int)devices.size() < gpus_tp) {
+            LLAMA_LOG_ERROR("%s: tensor parallelism requires at least %d GPUs, but only %zu available\n",
+                __func__, gpus_tp, devices.size());
             return false;
         }
 
 #ifdef GGML_USE_CUDA
-        // initialize tensor parallelism with device IDs
+        // Use the first gpus_tp devices for tensor parallelism
+        // This creates a single tensor parallel group using the specified number of GPUs
         std::vector<int> device_ids;
-        for (size_t i = 0; i < devices.size(); i++) {
-            // Extract device ID from device (this is a simplified approach)
-            device_ids.push_back(static_cast<int>(i));
+        for (int i = 0; i < gpus_tp; i++) {
+            device_ids.push_back(i);
         }
 
         if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
@@ -1976,8 +1976,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return false;
         }
 
-        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs per group, %zu total groups\n",
-            __func__, gpus_tp, devices.size() / gpus_tp);
+        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
+            __func__, gpus_tp, gpus_tp - 1);
 #else
         LLAMA_LOG_ERROR("%s: tensor parallelism requires CUDA support\n", __func__);
         return false;

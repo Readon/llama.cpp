@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <memory>
+#include "../ggml-impl.h"  // For GGML_LOG_ERROR
 
 #ifdef GGML_USE_NCCL
 #include <nccl.h>
@@ -14,9 +15,6 @@
         return false; \
     } \
 } while(0)
-
-// Global NCCL context
-static std::unique_ptr<ggml_cuda_nccl_context> g_nccl_ctx;
 
 // NCCL context implementation
 struct ggml_cuda_nccl_context {
@@ -39,22 +37,22 @@ struct ggml_cuda_nccl_context {
     }
     
     bool init_tp_group() {
-        ncclUniqueId id;
-        if (rank == 0) {
-            ncclGetUniqueId(&id);
+        // For single-process multi-GPU tensor parallelism, use ncclCommInitAll
+        // This is the recommended approach for single-process scenarios
+        std::vector<ncclComm_t> temp_comms(tp_size);
+        std::vector<int> temp_devices(device_ids.begin(), device_ids.end());
+
+        ncclResult_t result = ncclCommInitAll(temp_comms.data(), tp_size, temp_devices.data());
+        if (result != ncclSuccess) {
+            GGML_LOG_ERROR("Failed to initialize NCCL communicators: %s\n", ncclGetErrorString(result));
+            return false;
         }
-        
-        // Initialize NCCL communicators for each device
+
+        // Copy the communicators to our member variable
         for (int i = 0; i < tp_size; i++) {
-            cudaSetDevice(device_ids[i]);
-            ncclResult_t result = ncclCommInitRank(&comms[i], tp_size, id, i);
-            if (result != ncclSuccess) {
-                GGML_LOG_ERROR("Failed to initialize NCCL communicator for device %d: %s\n", 
-                              device_ids[i], ncclGetErrorString(result));
-                return false;
-            }
+            comms[i] = temp_comms[i];
         }
-        
+
         return true;
     }
     
@@ -87,6 +85,9 @@ struct ggml_cuda_nccl_context {
         return ncclAllGather(sendbuff, recvbuff, sendcount, datatype, comms[rank], stream);
     }
 };
+
+// Global NCCL context
+static std::unique_ptr<ggml_cuda_nccl_context> g_nccl_ctx;
 
 #endif // GGML_USE_NCCL
 

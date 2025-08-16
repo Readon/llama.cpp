@@ -71,14 +71,102 @@ if (CUDAToolkit_FOUND)
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
-    # Check for NCCL
+    # Check for NCCL with multiple detection methods (only if enabled)
+    set(NCCL_FOUND FALSE)
+
+    if (NOT GGML_CUDA_NCCL)
+        message(STATUS "NCCL detection disabled via GGML_CUDA_NCCL=OFF")
+    else()
+
+    # Support environment variables for NCCL detection
+    if (DEFINED ENV{NCCL_ROOT})
+        set(NCCL_ROOT $ENV{NCCL_ROOT})
+    endif()
+    if (DEFINED ENV{NCCL_DIR})
+        set(NCCL_ROOT $ENV{NCCL_DIR})
+    endif()
+
+    # Method 1: Try standard CMake package detection
     find_package(NCCL QUIET)
+    if (NCCL_FOUND)
+        message(STATUS "NCCL found via CMake package")
+        set(NCCL_LIBRARIES NCCL::nccl)
+    else()
+        # Method 2: Manual detection using find_path and find_library
+        # Look for NCCL header
+        find_path(NCCL_INCLUDE_DIR
+            NAMES nccl.h
+            HINTS
+                ${NCCL_ROOT}/include
+                ${CUDA_TOOLKIT_ROOT_DIR}/include
+                $ENV{CUDA_HOME}/include
+                /usr/include
+                /usr/local/include
+                /usr/local/cuda/include
+                /opt/nccl/include
+                /opt/cuda/include
+                # Common conda/mamba paths
+                $ENV{CONDA_PREFIX}/include
+                $ENV{PREFIX}/include
+                # Common module system paths
+                /apps/nccl/include
+                /sw/nccl/include
+            PATH_SUFFIXES nccl cuda/include
+        )
+
+        # Look for NCCL library
+        find_library(NCCL_LIBRARY
+            NAMES nccl libnccl
+            HINTS
+                ${NCCL_ROOT}/lib
+                ${NCCL_ROOT}/lib64
+                ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+                $ENV{CUDA_HOME}/lib64
+                /usr/lib
+                /usr/lib64
+                /usr/local/lib
+                /usr/local/lib64
+                /usr/local/cuda/lib64
+                /opt/nccl/lib
+                /opt/nccl/lib64
+                /opt/cuda/lib64
+                # Common conda/mamba paths
+                $ENV{CONDA_PREFIX}/lib
+                $ENV{PREFIX}/lib
+                # Common module system paths
+                /apps/nccl/lib
+                /apps/nccl/lib64
+                /sw/nccl/lib
+                /sw/nccl/lib64
+            PATH_SUFFIXES nccl cuda/lib64
+        )
+
+        # Check if both header and library were found
+        if (NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+            set(NCCL_FOUND TRUE)
+            message(STATUS "NCCL found manually: ${NCCL_LIBRARY}")
+            message(STATUS "NCCL include dir: ${NCCL_INCLUDE_DIR}")
+            set(NCCL_LIBRARIES ${NCCL_LIBRARY})
+            set(NCCL_INCLUDE_DIRS ${NCCL_INCLUDE_DIR})
+        endif()
+    endif()
+    endif() # End of GGML_CUDA_NCCL check
+
     if (NCCL_FOUND)
         message(STATUS "NCCL found, enabling tensor parallelism")
         add_compile_definitions(GGML_USE_NCCL)
-        target_link_libraries(ggml-cuda PRIVATE NCCL::nccl)
+        target_link_libraries(ggml-cuda PRIVATE ${NCCL_LIBRARIES})
+        if (NCCL_INCLUDE_DIRS)
+            target_include_directories(ggml-cuda PRIVATE ${NCCL_INCLUDE_DIRS})
+        endif()
     else()
-        message(WARNING "NCCL not found, tensor parallelism will be disabled")
+        if (GGML_CUDA_NCCL)
+            message(WARNING "NCCL not found, tensor parallelism will be disabled")
+            message(STATUS "To enable NCCL, install it or set NCCL_ROOT to the installation directory")
+            message(STATUS "You can also disable this warning with -DGGML_CUDA_NCCL=OFF")
+        else()
+            message(STATUS "NCCL detection disabled, tensor parallelism will use basic mode")
+        endif()
     endif()
 
     if (GGML_CUDA_GRAPHS)

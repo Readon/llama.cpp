@@ -217,14 +217,18 @@ bool ggml_backend_cuda_tp_context::init() {
     nccl_initialized = ggml_cuda_nccl_init(device_ids);
 
     if (!nccl_initialized) {
-        GGML_LOG_WARN("NCCL not available for tensor parallelism, falling back to basic mode\n");
-        GGML_LOG_WARN("Tensor parallelism will work but without optimized collective operations\n");
+        GGML_LOG_INFO("NCCL not available, using basic tensor parallelism mode\n");
+        GGML_LOG_INFO("Note: Install NCCL for optimized collective operations\n");
         // Continue without NCCL - basic tensor parallelism can still work
     } else {
-        GGML_LOG_INFO("NCCL initialized for tensor parallelism\n");
+        GGML_LOG_INFO("NCCL initialized for optimized tensor parallelism\n");
     }
 
-    GGML_LOG_INFO("Tensor parallelism initialized with %d GPUs\n", config.tp_size);
+    GGML_LOG_INFO("Tensor parallelism initialized: %d-way TP using GPUs ", config.tp_size);
+    for (size_t i = 0; i < device_ids.size(); i++) {
+        GGML_LOG_INFO("%d%s", device_ids[i], (i < device_ids.size() - 1) ? "," : "");
+    }
+    GGML_LOG_INFO("\n");
     return true;
 }
 
