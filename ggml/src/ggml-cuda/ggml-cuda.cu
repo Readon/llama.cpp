@@ -611,8 +611,8 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         // For distributed tensors, we need to copy only the relevant portion of data
         ggml_tp_allocation_info* alloc_info = ggml_cuda_tp_get_allocation_info(tensor);
         if (alloc_info && alloc_info->is_distributed) {
-            printf("DEBUG: Loading distributed tensor '%s' to GPU %d (allocated size: %.2f MiB)\n",
-                   ggml_get_name(tensor), alloc_info->target_gpu_id, alloc_info->allocated_bytes / 1024.0 / 1024.0);
+            // printf("DEBUG: Loading distributed tensor '%s' to GPU %d (allocated size: %.2f MiB)\n",
+            //        ggml_get_name(tensor), alloc_info->target_gpu_id, alloc_info->allocated_bytes / 1024.0 / 1024.0);
 
             // Set the correct device for the distributed tensor
             ggml_cuda_set_device(alloc_info->target_gpu_id);
@@ -717,7 +717,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     const ggml_tp_config* tp_config = ggml_cuda_tp_get_config_ptr();
     int target_device = buft_ctx->device;
 
-    printf("DEBUG: Buffer allocation request: %.2f MiB on device %d\n", size / 1024.0 / 1024.0, target_device);
+    // printf("DEBUG: Buffer allocation request: %.2f MiB on device %d\n", size / 1024.0 / 1024.0, target_device);
 
     // Remove the problematic buffer size reduction for tensor parallelism
     // The tensor-level size calculation already handles distributed allocation correctly
@@ -751,13 +751,13 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t size = ggml_nbytes(tensor);
 
     // Debug: Print detailed tensor size information
-    printf("DEBUG: get_alloc_size for '%s': type=%d, ggml_nbytes=%.2f MiB, dimensions=[%ld x %ld]\n",
-           ggml_get_name(tensor), tensor->type, size / (1024.0 * 1024.0), (long)tensor->ne[0], (long)tensor->ne[1]);
-    printf("DEBUG: Tensor details - ne[0]=%ld, ne[1]=%ld, ne[2]=%ld, ne[3]=%ld, nb[0]=%zu, nb[1]=%zu\n",
-           (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3],
-           tensor->nb[0], tensor->nb[1]);
-    printf("DEBUG: Tensor type_size=%zu, is_quantized=%s, tensor_ptr=%p\n",
-           ggml_type_size(tensor->type), ggml_is_quantized(tensor->type) ? "yes" : "no", (const void*)tensor);
+    // printf("DEBUG: get_alloc_size for '%s': type=%d, ggml_nbytes=%.2f MiB, dimensions=[%ld x %ld]\n",
+    //        ggml_get_name(tensor), tensor->type, size / (1024.0 * 1024.0), (long)tensor->ne[0], (long)tensor->ne[1]);
+    // printf("DEBUG: Tensor details - ne[0]=%ld, ne[1]=%ld, ne[2]=%ld, ne[3]=%ld, nb[0]=%zu, nb[1]=%zu\n",
+    //        (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3],
+    //        tensor->nb[0], tensor->nb[1]);
+    // printf("DEBUG: Tensor type_size=%zu, is_quantized=%s, tensor_ptr=%p\n",
+    //        ggml_type_size(tensor->type), ggml_is_quantized(tensor->type) ? "yes" : "no", (const void*)tensor);
 
     int64_t ne0 = tensor->ne[0];
 
@@ -771,19 +771,19 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     // Check if this tensor has distributed allocation info from tensor parallelism
     const ggml_tp_config* tp_config = ggml_cuda_tp_get_config_ptr();
     if (tp_config && tp_config->enabled) {
-        printf("DEBUG: Checking tensor '%s' for distributed allocation\n", ggml_get_name(tensor));
+        // printf("DEBUG: Checking tensor '%s' for distributed allocation\n", ggml_get_name(tensor));
         if (ggml_cuda_tp_has_distributed_allocation(tensor)) {
             size_t distributed_size = ggml_cuda_tp_get_distributed_buffer_size(tensor);
             // For distributed tensors, use the distributed size which is correctly calculated
             // and includes proper padding for quantized tensors
-            printf("Using distributed buffer size: %.2f MiB (original: %.2f MiB) for tensor %s\n",
-                   distributed_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0, ggml_get_name(tensor));
+            // printf("Using distributed buffer size: %.2f MiB (original: %.2f MiB) for tensor %s\n",
+            //        distributed_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0, ggml_get_name(tensor));
             return distributed_size;
         } else {
             // For non-distributed tensors in TP mode, use original size
             // These tensors are replicated across GPUs, so they need full size
-            printf("DEBUG: Non-distributed tensor '%s' using original size: %.2f MiB\n",
-                   ggml_get_name(tensor), size / 1024.0 / 1024.0);
+            // printf("DEBUG: Non-distributed tensor '%s' using original size: %.2f MiB\n",
+            //        ggml_get_name(tensor), size / 1024.0 / 1024.0);
             return size;
         }
     }
@@ -2320,8 +2320,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_tp_allocation_info* alloc_info = ggml_cuda_tp_get_allocation_info(dst->src[i]);
                 if (alloc_info && alloc_info->is_distributed && alloc_info->target_gpu_id != ctx.device) {
                     // Enable peer access between backend device and tensor device
-                    printf("DEBUG: Enabling peer access between device %d and %d for tensor %s\n",
-                           ctx.device, alloc_info->target_gpu_id, ggml_get_name(dst->src[i]));
+                    // printf("DEBUG: Enabling peer access between device %d and %d for tensor %s\n",
+                    //        ctx.device, alloc_info->target_gpu_id, ggml_get_name(dst->src[i]));
                     ggml_cuda_set_peer_access(1, ctx.device); // Use small batch size to enable peer access
                     break;
                 }
@@ -2332,8 +2332,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         if (ggml_cuda_tp_has_distributed_allocation(dst)) {
             ggml_tp_allocation_info* alloc_info = ggml_cuda_tp_get_allocation_info(dst);
             if (alloc_info && alloc_info->is_distributed && alloc_info->target_gpu_id != ctx.device) {
-                printf("DEBUG: Enabling peer access between device %d and %d for dst tensor %s\n",
-                       ctx.device, alloc_info->target_gpu_id, ggml_get_name(dst));
+                // printf("DEBUG: Enabling peer access between device %d and %d for dst tensor %s\n",
+                //        ctx.device, alloc_info->target_gpu_id, ggml_get_name(dst));
                 ggml_cuda_set_peer_access(1, ctx.device);
             }
         }
@@ -2388,7 +2388,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     }
 
                     if (has_distributed) {
-                        printf("DEBUG: ADD operation with distributed tensors - skipping for now to avoid crash\n");
+                        // printf("DEBUG: ADD operation with distributed tensors - skipping for now to avoid crash\n");
                         // For now, skip distributed ADD operations to prevent crashes
                         // TODO: Implement proper distributed ADD computation
                         break;
@@ -2423,7 +2423,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     }
 
                     if (has_distributed) {
-                        printf("DEBUG: MUL operation with distributed tensors - skipping for now to avoid crash\n");
+                        // printf("DEBUG: MUL operation with distributed tensors - skipping for now to avoid crash\n");
                         // For now, skip distributed MUL operations to prevent crashes
                         // TODO: Implement proper distributed MUL computation
                         break;
@@ -2557,7 +2557,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     }
 
                     if (has_distributed) {
-                        printf("DEBUG: RMS_NORM operation with distributed tensors - skipping for now to avoid crash\n");
+                        // printf("DEBUG: RMS_NORM operation with distributed tensors - skipping for now to avoid crash\n");
                         // For now, skip distributed RMS_NORM operations to prevent crashes
                         // TODO: Implement proper distributed RMS_NORM computation
                         break;
@@ -2587,7 +2587,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     }
 
                     if (has_distributed) {
-                        printf("DEBUG: MUL_MAT operation with distributed tensors - skipping for now to avoid crash\n");
+                        // printf("DEBUG: MUL_MAT operation with distributed tensors - skipping for now to avoid crash\n");
                         // For now, skip distributed MUL_MAT operations to prevent crashes
                         // TODO: Implement proper distributed MUL_MAT computation
                         break;

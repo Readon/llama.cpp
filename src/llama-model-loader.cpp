@@ -818,7 +818,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
                     // Apply actual tensor splitting for performance improvement
                     bool applied = ggml_apply_tensor_parallel_split_c(tensor, tp_config, strategy);
                     if (applied) {
-                        printf("Applied TP %s to %s: %s [%ld x %ld] -> distributed across %d GPUs\n",
+                        LLAMA_LOG_DEBUG("Applied TP %s to %s: %s [%ld x %ld] -> distributed across %d GPUs\n",
                                strategy == GGML_TP_STRATEGY_COLUMN ? "column-split" : "row-split",
                                tensor_name.c_str(),
                                strategy == GGML_TP_STRATEGY_ROW ? "(requires AllReduce)" : "(parallel)",
