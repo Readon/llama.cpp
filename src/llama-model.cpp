@@ -1968,50 +1968,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
 #ifdef GGML_USE_CUDA
-        // Calculate number of tensor parallel groups
-        int total_gpus = static_cast<int>(devices.size());
-        int num_tp_groups = total_gpus / gpus_tp;
-
-        if (total_gpus % gpus_tp != 0) {
-            LLAMA_LOG_WARN("%s: total GPUs (%d) is not divisible by gpus_tp (%d), using %d complete groups\n",
-                __func__, total_gpus, gpus_tp, num_tp_groups);
-            LLAMA_LOG_WARN("%s: %d GPUs will be unused\n", __func__, total_gpus % gpus_tp);
+        // For simplicity and stability, always use single-group tensor parallelism
+        // This uses exactly the number of GPUs specified by gpus_tp
+        std::vector<int> device_ids;
+        for (int i = 0; i < gpus_tp; i++) {
+            device_ids.push_back(i);
         }
 
-        if (num_tp_groups == 0) {
-            LLAMA_LOG_ERROR("%s: not enough GPUs to form even one tensor parallel group\n", __func__);
+        if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
+            LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
             return false;
         }
 
-        if (num_tp_groups > 1) {
-            // Initialize multi-group tensor parallelism
-            LLAMA_LOG_INFO("%s: initializing multi-group tensor parallelism: %d groups, each with %d GPUs\n",
-                __func__, num_tp_groups, gpus_tp);
-
-            if (!ggml_cuda_multi_tp_init(num_tp_groups, gpus_tp)) {
-                LLAMA_LOG_ERROR("%s: failed to initialize multi-group tensor parallelism\n", __func__);
-                return false;
-            }
-
-            LLAMA_LOG_INFO("%s: multi-group tensor parallelism enabled with %d groups of %d GPUs each\n",
-                __func__, num_tp_groups, gpus_tp);
-            LLAMA_LOG_INFO("%s: total GPUs used: %d (GPUs 0-%d)\n",
-                __func__, num_tp_groups * gpus_tp, num_tp_groups * gpus_tp - 1);
-        } else {
-            // Initialize single-group tensor parallelism (legacy mode)
-            std::vector<int> device_ids;
-            for (int i = 0; i < gpus_tp; i++) {
-                device_ids.push_back(i);
-            }
-
-            if (!ggml_cuda_tp_init(gpus_tp, device_ids.data(), static_cast<int>(device_ids.size()))) {
-                LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
-                return false;
-            }
-
-            LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
-                __func__, gpus_tp, gpus_tp - 1);
-        }
+        LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
+            __func__, gpus_tp, gpus_tp - 1);
 #else
         LLAMA_LOG_ERROR("%s: tensor parallelism requires CUDA support\n", __func__);
         return false;
@@ -5687,7 +5657,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         else {
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
             if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                // Check if this is a tensor parallelism allocation failure
+                if (gpus_tp > 1) {
+                    LLAMA_LOG_WARN("%s: tensor parallelism allocation failed for %s buffer, attempting fallback to single GPU\n",
+                                   __func__, ggml_backend_buft_name(buft));
+
+                    // Disable tensor parallelism and try again
+#ifdef GGML_USE_CUDA
+                    ggml_cuda_tp_cleanup();
+                    LLAMA_LOG_INFO("%s: tensor parallelism disabled, falling back to single GPU mode\n", __func__);
+#endif
+
+                    // Try allocation again without tensor parallelism
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer even after disabling tensor parallelism", ggml_backend_buft_name(buft)));
+                    }
+                    LLAMA_LOG_INFO("%s: successfully allocated buffer after disabling tensor parallelism\n", __func__);
+                } else {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
             }
             pimpl->bufs.emplace_back(buf);
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {

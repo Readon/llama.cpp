@@ -37,6 +37,27 @@ bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
                                      const ggml_tp_config& tp_config,
                                      ggml_tp_strategy strategy);
 
+// Allocation info for distributed tensors
+struct ggml_tp_allocation_info {
+    int target_gpu_id;
+    int group_id;
+    size_t allocated_bytes;
+    bool is_distributed;
+    ggml_tp_strategy strategy;  // Store the splitting strategy
+};
+
+// Distribute tensor memory across GPUs with proper memory allocation
+bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
+                                          const ggml_tp_config& tp_config,
+                                          ggml_tp_strategy strategy,
+                                          int group_id);
+
+// Functions to handle distributed tensor allocation
+bool ggml_cuda_tp_has_distributed_allocation(const struct ggml_tensor* tensor);
+ggml_tp_allocation_info* ggml_cuda_tp_get_allocation_info(const struct ggml_tensor* tensor);
+size_t ggml_cuda_tp_get_distributed_buffer_size(const struct ggml_tensor* tensor);
+int ggml_cuda_tp_get_target_gpu(const struct ggml_tensor* tensor);
+
 // Tensor name patterns for different TP strategies
 namespace ggml_tp_patterns {
     // Patterns that should use column-wise splitting

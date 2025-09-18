@@ -804,7 +804,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
     ggml_set_name(tensor, ggml_get_name(cur));
 
 #ifdef GGML_USE_CUDA
-    // Apply tensor parallelism if available
+    // Apply tensor parallelism if available and enabled
     if (ggml_cuda_multi_tp_available()) {
         const std::string tensor_name = name;
 
@@ -818,11 +818,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
                     // Apply actual tensor splitting for performance improvement
                     bool applied = ggml_apply_tensor_parallel_split_c(tensor, tp_config, strategy);
                     if (applied) {
-                        printf("Applied TP %s to %s: %s [%ld x %ld] -> [%ld x %ld]\n",
+                        printf("Applied TP %s to %s: %s [%ld x %ld] -> distributed across %d GPUs\n",
                                strategy == GGML_TP_STRATEGY_COLUMN ? "column-split" : "row-split",
                                tensor_name.c_str(),
                                strategy == GGML_TP_STRATEGY_ROW ? "(requires AllReduce)" : "(parallel)",
-                               tensor->ne[0], tensor->ne[1], tensor->ne[0], tensor->ne[1]);
+                               tensor->ne[0], tensor->ne[1], tp_config->tp_size);
+
+                        // Tensor has been distributed across GPUs
                     } else {
                         // Log warning if split failed, but continue execution
                         fprintf(stderr, "Warning: Failed to apply tensor parallelism to %s\n", tensor_name.c_str());

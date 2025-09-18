@@ -10,6 +10,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -230,6 +234,17 @@ static struct llama_model * llama_model_load_from_file_impl(
 
         LLAMA_LOG_INFO("%s: tensor parallelism enabled with %d GPUs (using GPUs 0-%d)\n",
             __func__, params.gpus_tp, params.gpus_tp - 1);
+
+#ifdef GGML_USE_CUDA
+        // Initialize tensor parallelism
+        bool tp_init_success = ggml_cuda_multi_tp_init(1, params.gpus_tp);
+        if (!tp_init_success) {
+            LLAMA_LOG_ERROR("%s: failed to initialize tensor parallelism\n", __func__);
+            llama_model_free(model);
+            return nullptr;
+        }
+        LLAMA_LOG_INFO("%s: tensor parallelism initialized successfully\n", __func__);
+#endif
     }
 
     for (auto * dev : model->devices) {
