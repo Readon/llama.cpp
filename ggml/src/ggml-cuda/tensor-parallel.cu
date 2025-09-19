@@ -322,7 +322,9 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
 
     // Ensure the dimension is divisible by tp_size
     if (split_dim_size % tp_config.tp_size != 0) {
-        printf("  Warning: Dimension %ld not divisible by TP size %d\n", split_dim_size, tp_config.tp_size);
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: Warning: Dimension %ld not divisible by TP size %d\n", __func__, split_dim_size, tp_config.tp_size);
+#endif
         return false;
     }
 
@@ -331,8 +333,10 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
         int64_t split_size = split_dim_size / tp_config.tp_size;
         int64_t blck_size = ggml_blck_size(tensor->type);
         if (split_size % blck_size != 0) {
-            printf("  Warning: Split size %ld not compatible with quantization block size %ld for tensor %s\n",
-                   split_size, blck_size, ggml_get_name(tensor));
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: Warning: Split size %ld not compatible with quantization block size %ld for tensor %s\n",
+                   __func__, split_size, blck_size, ggml_get_name(tensor));
+#endif
             return false;
         }
     }

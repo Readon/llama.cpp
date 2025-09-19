@@ -2405,7 +2405,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
                     if (has_distributed) {
 #ifndef NDEBUG
-                        GGML_LOG_DEBUG("%s: ADD operation with distributed tensors - performing distributed computation\n", __func__);
+                        // GGML_LOG_DEBUG("%s: ADD operation with distributed tensors - performing distributed computation\n", __func__);
 #endif
                         // For distributed tensors, perform the ADD operation on the appropriate GPU
                         // ADD operations are element-wise, so they can be computed locally on each GPU
@@ -2580,7 +2580,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
                     if (has_distributed) {
 #ifndef NDEBUG
-                        GGML_LOG_DEBUG("%s: RMS_NORM operation with distributed tensors - performing distributed computation\n", __func__);
+                        // GGML_LOG_DEBUG("%s: RMS_NORM operation with distributed tensors - performing distributed computation\n", __func__);
 #endif
                         // For distributed tensors, perform the RMS_NORM operation
                         // RMS_NORM can be computed locally on each GPU for distributed tensors
@@ -2613,7 +2613,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
                     if (has_distributed) {
 #ifndef NDEBUG
-                        GGML_LOG_DEBUG("%s: MUL_MAT operation with distributed tensors - performing distributed computation\n", __func__);
+                        // GGML_LOG_DEBUG("%s: MUL_MAT operation with distributed tensors - performing distributed computation\n", __func__);
 #endif
                         // For distributed tensors, perform the MUL_MAT operation
                         // The mmq.cu implementation already has tensor parallelism support
