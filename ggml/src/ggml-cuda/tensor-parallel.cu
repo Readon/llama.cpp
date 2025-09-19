@@ -176,7 +176,9 @@ bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
         return false;
     }
 
-    // printf("  Using TP group %d for tensor distribution\n", group_id);
+#ifndef NDEBUG
+    GGML_LOG_DEBUG("%s: using TP group %d for tensor distribution\n", __func__, group_id);
+#endif
 
     ggml_tp_split_info split_info = ggml_calculate_tp_split(tensor, strategy, tp_config);
 
@@ -214,9 +216,11 @@ bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
             return false;
         }
 
-        // printf("  Column split: [%ld x %ld] -> [%ld x %ld] (rank %d/%d) - INFO ONLY (no dimension modification)\n",
-        //        tensor->ne[0], original_cols, tensor->ne[0], actual_cols,
-        //        tp_config.tp_rank, tp_config.tp_size);
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: column split: [%ld x %ld] -> [%ld x %ld] (rank %d/%d) - INFO ONLY (no dimension modification)\n",
+               __func__, tensor->ne[0], original_cols, tensor->ne[0], actual_cols,
+               tp_config.tp_rank, tp_config.tp_size);
+#endif
 
     } else if (strategy == GGML_TP_STRATEGY_ROW) {
         int64_t original_rows = tensor->ne[0];
@@ -232,9 +236,11 @@ bool ggml_apply_tensor_parallel_split(struct ggml_tensor* tensor,
             return false;
         }
 
-        // printf("  Row split: [%ld x %ld] -> [%ld x %ld] (rank %d/%d) - INFO ONLY (no dimension modification)\n",
-        //        original_rows, tensor->ne[1], actual_rows, tensor->ne[1],
-        //        tp_config.tp_rank, tp_config.tp_size);
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: row split: [%ld x %ld] -> [%ld x %ld] (rank %d/%d) - INFO ONLY (no dimension modification)\n",
+               __func__, original_rows, tensor->ne[1], actual_rows, tensor->ne[1],
+               tp_config.tp_rank, tp_config.tp_size);
+#endif
     }
 
     // Distribute memory across GPUs without modifying tensor dimensions
@@ -278,12 +284,14 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
     size_t total_bytes = ggml_nbytes(tensor);
 
     // Debug: Print tensor type and size information
-    // printf("  DEBUG: Tensor '%s' type=%d, element_size=%zu bytes, total_bytes=%.2f MB\n",
-    //        ggml_get_name(tensor), tensor->type, element_size, total_bytes / (1024.0 * 1024.0));
-    // printf("  DEBUG: Tensor dimensions [%ld x %ld], is_quantized=%s, tensor_ptr=%p\n",
-    //        (long)tensor->ne[0], (long)tensor->ne[1], ggml_is_quantized(tensor->type) ? "yes" : "no", (const void*)tensor);
-    // printf("  DEBUG: Tensor details - ne[0]=%ld, ne[1]=%ld, nb[0]=%zu, nb[1]=%zu\n",
-    //        (long)tensor->ne[0], (long)tensor->ne[1], tensor->nb[0], tensor->nb[1]);
+#ifndef NDEBUG
+    GGML_LOG_DEBUG("%s: tensor '%s' type=%d, element_size=%zu bytes, total_bytes=%.2f MB\n",
+           __func__, ggml_get_name(tensor), tensor->type, element_size, total_bytes / (1024.0 * 1024.0));
+    GGML_LOG_DEBUG("%s: tensor dimensions [%ld x %ld], is_quantized=%s, tensor_ptr=%p\n",
+           __func__, (long)tensor->ne[0], (long)tensor->ne[1], ggml_is_quantized(tensor->type) ? "yes" : "no", (const void*)tensor);
+    GGML_LOG_DEBUG("%s: tensor details - ne[0]=%ld, ne[1]=%ld, nb[0]=%zu, nb[1]=%zu\n",
+           __func__, (long)tensor->ne[0], (long)tensor->ne[1], tensor->nb[0], tensor->nb[1]);
+#endif
 
     // Calculate split dimensions based on strategy
     int64_t split_dim_size;
@@ -308,8 +316,10 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
     // This correctly handles Q4/Q6 quantization without element size confusion
     size_t bytes_per_rank = total_bytes / tp_config.tp_size;
 
-    // printf("  DEBUG: Corrected memory calculation - total_bytes=%.2f MB, bytes_per_rank=%.2f MB\n",
-    //        total_bytes / (1024.0 * 1024.0), bytes_per_rank / (1024.0 * 1024.0));
+#ifndef NDEBUG
+    GGML_LOG_DEBUG("%s: corrected memory calculation - total_bytes=%.2f MB, bytes_per_rank=%.2f MB\n",
+           __func__, total_bytes / (1024.0 * 1024.0), bytes_per_rank / (1024.0 * 1024.0));
+#endif
 
     // Apply padding for quantized tensors based on distributed dimensions
     if (ggml_is_quantized(tensor->type)) {
@@ -318,14 +328,18 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
             size_t padding_elements = MATRIX_ROW_PADDING - (ne0_per_rank % MATRIX_ROW_PADDING);
             size_t padding_bytes = ggml_row_size(tensor->type, padding_elements);
             bytes_per_rank += padding_bytes;
-            // printf("  DEBUG: Added padding: %zu elements, %zu bytes for tensor %s\n",
-            //        padding_elements, padding_bytes, ggml_get_name(tensor));
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: added padding: %zu elements, %zu bytes for tensor %s\n",
+                   __func__, padding_elements, padding_bytes, ggml_get_name(tensor));
+#endif
         }
     }
 
-    // printf("  Distributing tensor memory: %.2f MB per GPU (total %.2f MB, strategy: %s)\n",
-    //        bytes_per_rank / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
-    //        strategy == GGML_TP_STRATEGY_COLUMN ? "column-split" : "row-split");
+#ifndef NDEBUG
+    GGML_LOG_DEBUG("%s: distributing tensor memory: %.2f MB per GPU (total %.2f MB, strategy: %s)\n",
+           __func__, bytes_per_rank / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
+           strategy == GGML_TP_STRATEGY_COLUMN ? "column-split" : "row-split");
+#endif
 
     // For now, we implement a simplified memory distribution strategy
     // that reduces memory pressure by distributing tensors across different GPUs
@@ -338,11 +352,13 @@ bool ggml_cuda_tp_distribute_tensor_memory(struct ggml_tensor* tensor,
     int target_gpu_id = group_ctx->device_ids[target_gpu_rank];
     tensor_distribution_counter++;
 
-    // printf("  Assigning tensor to GPU %d (rank %d in group %d)\n",
-    //        target_gpu_id, target_gpu_rank, group_id);
+#ifndef NDEBUG
+    GGML_LOG_DEBUG("%s: assigning tensor to GPU %d (rank %d in group %d)\n",
+           __func__, target_gpu_id, target_gpu_rank, group_id);
 
-    // printf("  Reduced tensor memory footprint: %.2f MB -> %.2f MB per GPU\n",
-    //        total_bytes / (1024.0 * 1024.0), bytes_per_rank / (1024.0 * 1024.0));
+    GGML_LOG_DEBUG("%s: reduced tensor memory footprint: %.2f MB -> %.2f MB per GPU\n",
+           __func__, total_bytes / (1024.0 * 1024.0), bytes_per_rank / (1024.0 * 1024.0));
+#endif
 
     // Store the distributed memory information in the global registry
     ggml_tp_allocation_info alloc_info;
