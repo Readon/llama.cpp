@@ -108,6 +108,9 @@ struct ggml_backend_cuda_tp_context {
 
     bool init();
     void cleanup();
+
+private:
+    bool init_peer_access();
 };
 
 // Multi-group tensor parallelism manager

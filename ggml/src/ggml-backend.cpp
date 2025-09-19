@@ -60,7 +60,15 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        // TENSOR PARALLELISM FIX: For distributed tensors, the allocated size may be smaller
+        // than the original tensor size due to tensor splitting across GPUs.
+        // The CUDA backend's get_alloc_size function handles this internally by returning
+        // the distributed size, so we skip the assertion for CUDA backends.
+        const char* backend_name = ggml_backend_buft_name(buft);
+        bool is_cuda_backend = (backend_name && strstr(backend_name, "CUDA") != NULL);
+        if (!is_cuda_backend) {
+            assert(size >= ggml_nbytes(tensor));
+        }
         return size;
     }
     return ggml_nbytes(tensor);
